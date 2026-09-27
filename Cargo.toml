@@ -1,7 +1,7 @@
 [package]
 name = "weft"
 version = "0.1.0"
-description = "Weft: an ASGI server for Python written in Rust on Tokio, running in the same thread as the asyncio event loop"
+description = "Weft is an ASGI and WSGI server for FastAPI, Flask and the rest."
 license = "MIT"
 edition = "2024"
 readme = "README.md"
