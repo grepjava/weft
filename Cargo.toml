@@ -1,7 +1,7 @@
 [package]
 name = "weft"
 version = "0.1.0"
-description = "Weft is an ASGI and WSGI server for FastAPI, Flask and the rest."
+description = "Weft is an ASGI and WSGI server for FastAPI, Flask and the rest. It is written in Rust on Tokio and runs inside the Python thread that runs your application."
 license = "MIT"
 edition = "2024"
 readme = "README.md"
