@@ -1,0 +1,12 @@
+target/
+.venv*/
+__pycache__/
+*.pyd
+*.so
+*.egg-info/
+dist/
+.pytest_cache/
+*.pdb
+bench/results/
+.claude/
+bench/apps/static/

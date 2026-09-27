@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 520" width="100%" height="100%">
+  <defs>
+    <linearGradient id="vLeftFlow" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1E40AF" />
+      <stop offset="45%" stop-color="#3B82F6" />
+      <stop offset="90%" stop-color="#7C3AED" />
+      <stop offset="100%" stop-color="#9333EA" />
+    </linearGradient>
+
+    <linearGradient id="vRightFlow" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#A855F7" />
+      <stop offset="30%" stop-color="#E11D48" />
+      <stop offset="70%" stop-color="#EA580C" />
+      <stop offset="100%" stop-color="#C2410C" />
+    </linearGradient>
+
+    <filter id="subtleDrop3" x="-10%" y="-10%" width="130%" height="130%">
+      <feDropShadow dx="0" dy="6" stdDeviation="7" flood-color="#090D1A" flood-opacity="0.2" />
+    </filter>
+  </defs>
+
+  <g id="continuum-mark" filter="url(#subtleDrop3)">
+    <path d="M 192,98 L 253,272 A 16 16 0 0 0 263,278 L 267,278 A 16 16 0 0 0 277,272 L 322,88" 
+          fill="none" 
+          stroke="url(#vLeftFlow)" 
+          stroke-width="50" 
+          stroke-linecap="butt" 
+          stroke-linejoin="round" />
+
+    <path d="M 278,88 L 323,272 A 16 16 0 0 0 333,278 L 337,278 A 16 16 0 0 0 347,272 L 408,98" 
+          fill="none" 
+          stroke="url(#vRightFlow)" 
+          stroke-width="50" 
+          stroke-linecap="butt" 
+          stroke-linejoin="round" />
+  </g>
+
+  <!-- Wordmark -->
+  <text x="300" y="405" 
+        font-family="system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Inter, sans-serif" 
+        font-size="94" 
+        font-weight="800" 
+        letter-spacing="-1.5px" 
+        fill="#FFFFFF"
+        text-anchor="middle">weft</text>
+
+  <text x="300" y="440" 
+        font-family="system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Inter, sans-serif" 
+        font-size="13" 
+        font-weight="600" 
+        letter-spacing="3px" 
+        fill="#64748B" 
+        text-anchor="middle">SEAMLESSLY PYRUSTIC</text>
+</svg>

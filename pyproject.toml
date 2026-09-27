@@ -1,0 +1,79 @@
+[project]
+name = 'weft-server'
+classifiers = [
+    'Development Status :: 3 - Alpha',
+    'Intended Audience :: Developers',
+    'License :: OSI Approved :: MIT License',
+    'Operating System :: MacOS',
+    'Operating System :: Microsoft :: Windows',
+    'Operating System :: POSIX :: Linux',
+    'Programming Language :: Python :: 3',
+    'Programming Language :: Python :: 3.10',
+    'Programming Language :: Python :: 3.11',
+    'Programming Language :: Python :: 3.12',
+    'Programming Language :: Python :: 3.13',
+    'Programming Language :: Python :: 3.14',
+    'Programming Language :: Python :: Free Threading :: 2 - Beta',
+    'Programming Language :: Python :: Implementation :: CPython',
+    'Programming Language :: Rust',
+    'Topic :: Internet :: WWW/HTTP',
+]
+dynamic = ['description', 'keywords', 'license', 'readme', 'version']
+requires-python = '>=3.10'
+dependencies = []
+
+[dependency-groups]
+build = ['maturin~=1.15']
+lint = ['ruff~=0.15.0']
+test = [
+    'aioquic~=1.2',
+    'fastapi~=0.141',
+    'h2~=4.2',
+    'httpx[http2]~=0.28',
+    'pytest~=9.0',
+    'pytest-timeout~=2.4',
+    'websockets~=17.1',
+]
+bench = [
+    'fastapi~=0.141',
+    'httptools~=0.7',
+    'psutil~=7.0',
+    'uvicorn~=0.52',
+]
+all = [
+    { include-group = 'bench' },
+    { include-group = 'build' },
+    { include-group = 'lint' },
+    { include-group = 'test' },
+]
+
+[project.scripts]
+weft = 'weft.cli:entrypoint'
+
+[build-system]
+requires = ['maturin>=1.15,<2']
+build-backend = 'maturin'
+
+[tool.maturin]
+module-name = 'weft._weft'
+bindings = 'pyo3'
+
+[tool.ruff]
+line-length = 120
+extend-select = ['B', 'C4', 'I', 'Q', 'W', 'UP']
+extend-ignore = ['B904', 'E501']
+flake8-quotes = { inline-quotes = 'single', multiline-quotes = 'double' }
+
+[tool.ruff.format]
+quote-style = 'single'
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+lines-after-imports = 2
+known-first-party = ['weft', 'tests']
+
+[tool.pytest.ini_options]
+timeout = 60
+
+[tool.uv]
+package = false

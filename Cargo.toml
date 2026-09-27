@@ -1,0 +1,79 @@
+[package]
+name = "weft"
+version = "0.1.0"
+description = "Weft: an ASGI server for Python written in Rust on Tokio, running in the same thread as the asyncio event loop"
+license = "MIT"
+edition = "2024"
+readme = "README.md"
+keywords = ["web", "asyncio", "asgi"]
+
+include = [
+    "/Cargo.toml",
+    "/pyproject.toml",
+    "/build.rs",
+    "/LICENSE",
+    "/README.md",
+    "/src",
+    "/weft",
+    "!__pycache__",
+    "!*.so",
+    "!*.pyd",
+]
+
+[lib]
+name = "_weft"
+crate-type = ["cdylib"]
+
+[dependencies]
+base64 = "0.23.1"
+brotli = "8"
+bytes = "1.11"
+flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs"] }
+h2 = "0.4"
+h3 = { version = "0.0.8", features = ["i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
+h3-quinn = "0.0.10"
+http = "1"
+quinn = { version = "0.11", default-features = false, features = ["rustls-ring", "runtime-tokio"] }
+httparse = "1.10"
+memmap2 = "0.9"
+mimalloc = { version = "0.1.49", default-features = false, optional = true }
+pyo3-ffi = "=0.29.2"
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+rustls-pemfile = "2"
+sha1 = "0.11.0"
+simdutf8 = "0.1.5"
+slab = "0.4"
+socket2 = { version = "0.6", features = ["all"] }
+tokio = { version = "1.53", features = ["rt", "net", "time", "macros", "sync", "io-util"] }
+x509-parser = "0.17"
+zstd = "0.13"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+] }
+
+[build-dependencies]
+pyo3-build-config = "=0.29.2"
+
+[features]
+default = ["mimalloc"]
+mimalloc = ["dep:mimalloc"]
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false
