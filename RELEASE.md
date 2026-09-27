@@ -1,5 +1,5 @@
 <div align="center">
-  <img width="420" src="assets/weft-spectral-continuum.svg" alt="weft">
+  <img width="420" src="https://raw.githubusercontent.com/grepjava/weft/master/assets/weft-spectral-continuum.svg" alt="weft">
 </div>
 
 # Releases
@@ -17,8 +17,8 @@ Distribution name: `weft-server`. Import package `weft`, CLI `weft`.
 
 ## Unreleased
 
-The tree on `master` since the rewrite (`2300a2e`). Not yet a numbered
-PyPI release.
+The tree on `master` for the first PyPI release (`weft-server` 0.1.0).
+Tag `v0.1.0` to publish.
 
 ### Added
 
@@ -53,10 +53,24 @@ PyPI release.
 
 ### Known
 
-- WebTransport stream and datagram *sends* after an incoming session: the
-  QUIC connection is locally closed on that path; five data-plane tests are
-  skipped.
 - ACME is not implemented; leave issuance to Caddy.
 - Raw WSGI is slower than Peregrine's asyncio-free poller (76% at 256
   connections on the contract). Raw ASGI and FastAPI match Peregrine and
-  are 1.5–1.9× Granian 2.8.3. [BENCHMARKS.md](BENCHMARKS.md).
+  are 1.5–1.9× Granian 2.8.3. [BENCHMARKS.md](https://github.com/grepjava/weft/blob/master/BENCHMARKS.md).
+
+---
+
+## Publishing to PyPI
+
+Wheels are built and uploaded by `.github/workflows/release.yml` on a
+`v*` tag. Version in `Cargo.toml` must match the tag (`v0.1.0` → `0.1.0`).
+
+1. On [PyPI](https://pypi.org/manage/account/publishing/), add a **pending
+   trusted publisher** for `weft-server`:
+   - Owner: `grepjava`
+   - Repository: `weft`
+   - Workflow name: `release.yml`
+   - Environment name: `release`
+2. `git tag v0.1.0 && git push origin v0.1.0`
+
+The first upload creates the project. Later tags reuse the same publisher.

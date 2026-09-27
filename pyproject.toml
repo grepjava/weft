@@ -1,5 +1,6 @@
 [project]
 name = 'weft-server'
+authors = [{ name = 'grepjava', email = 'grepjava@gmail.com' }]
 classifiers = [
     'Development Status :: 3 - Alpha',
     'Intended Audience :: Developers',
@@ -17,10 +18,17 @@ classifiers = [
     'Programming Language :: Python :: Implementation :: CPython',
     'Programming Language :: Rust',
     'Topic :: Internet :: WWW/HTTP',
+    'Topic :: Internet :: WWW/HTTP :: HTTP Servers',
 ]
 dynamic = ['description', 'keywords', 'license', 'readme', 'version']
 requires-python = '>=3.10'
 dependencies = []
+
+[project.urls]
+Homepage = 'https://github.com/grepjava/weft'
+Repository = 'https://github.com/grepjava/weft'
+Issues = 'https://github.com/grepjava/weft/issues'
+Changelog = 'https://github.com/grepjava/weft/blob/master/RELEASE.md'
 
 [dependency-groups]
 build = ['maturin~=1.15']
@@ -57,6 +65,10 @@ build-backend = 'maturin'
 [tool.maturin]
 module-name = 'weft._weft'
 bindings = 'pyo3'
+
+[tool.maturin.generate-ci.github]
+trusted-publishing = true
+publishing-environment = 'release'
 
 [tool.ruff]
 line-length = 120

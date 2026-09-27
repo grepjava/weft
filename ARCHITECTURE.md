@@ -1,5 +1,5 @@
 <div align="center">
-  <img width="420" src="assets/weft-spectral-continuum.svg" alt="weft">
+  <img width="420" src="https://raw.githubusercontent.com/grepjava/weft/master/assets/weft-spectral-continuum.svg" alt="weft">
 </div>
 
 # Architecture

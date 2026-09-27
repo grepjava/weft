@@ -1,5 +1,5 @@
 <div align="center">
-  <img width="420" src="assets/weft-spectral-continuum.svg" alt="weft">
+  <img width="420" src="https://raw.githubusercontent.com/grepjava/weft/master/assets/weft-spectral-continuum.svg" alt="weft">
 </div>
 
 # Weft
@@ -25,9 +25,9 @@ weft.run(app, host='0.0.0.0', port=8000)
 HTTP/1.1, HTTP/2, HTTP/3, WebSocket and WebTransport. TLS, static files,
 compression, a response cache, and Prometheus. ACME is left to Caddy.
 
-**Further reading:** [ARCHITECTURE.md](ARCHITECTURE.md) — how it is built.
-[BENCHMARKS.md](BENCHMARKS.md) — Weft, Peregrine and Granian on the-benchmarker
-contract. [RELEASE.md](RELEASE.md) — what changed. [bench/README.md](bench/README.md)
+**Further reading:** [ARCHITECTURE.md](https://github.com/grepjava/weft/blob/master/ARCHITECTURE.md) — how it is built.
+[BENCHMARKS.md](https://github.com/grepjava/weft/blob/master/BENCHMARKS.md) — Weft, Peregrine and Granian on the-benchmarker
+contract. [RELEASE.md](https://github.com/grepjava/weft/blob/master/RELEASE.md) — what changed. [bench/README.md](https://github.com/grepjava/weft/blob/master/bench/README.md)
 — the closed-loop FastAPI matrix.
 
 ## How it works
@@ -84,7 +84,7 @@ contract. [RELEASE.md](RELEASE.md) — what changed. [bench/README.md](bench/REA
 
 the-benchmarker contract, 256 connections, 4 workers, `zrk` open-loop ramp,
 CPython 3.14.7. Median of three 15 s runs, every request 2xx.
-[How that was measured.](BENCHMARKS.md)
+[How that was measured.](https://github.com/grepjava/weft/blob/master/BENCHMARKS.md)
 
 | app | Weft | Peregrine 1.1.7 | Granian 2.8.3 |
 |---|---:|---:|---:|
@@ -111,17 +111,23 @@ Each server uses one core. With four worker processes (`--set scaling`),
 `GET /` reaches 35,200 requests per second against uvicorn's 24,300, and
 the path parameter endpoint 26,800 against 20,100.
 
-## Install (from source)
+## Install
+
+```
+pip install weft-server
+```
+
+Distribution name: `weft-server` (the PyPI name `weft` belongs to an unrelated
+project). Import package `weft`, CLI `weft`. CPython 3.10+; wheels for Linux,
+macOS and Windows. Tested on 3.14 and free-threaded 3.14t.
+
+From source:
 
 ```
 uv venv --python 3.14 .venv
 uv pip install maturin
 maturin develop --release
 ```
-
-Distribution name: `weft-server` (the PyPI name `weft` belongs to an unrelated
-project). Import package `weft`, CLI `weft`. CPython only, 3.10+ by design;
-tested on 3.14 and free-threaded 3.14t.
 
 ## Scope
 

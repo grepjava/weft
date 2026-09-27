@@ -5,7 +5,10 @@ description = "Weft: an ASGI server for Python written in Rust on Tokio, running
 license = "MIT"
 edition = "2024"
 readme = "README.md"
-keywords = ["web", "asyncio", "asgi"]
+keywords = ["web", "asyncio", "asgi", "wsgi", "http3"]
+authors = ["grepjava <grepjava@gmail.com>"]
+repository = "https://github.com/grepjava/weft"
+homepage = "https://github.com/grepjava/weft"
 
 include = [
     "/Cargo.toml",
