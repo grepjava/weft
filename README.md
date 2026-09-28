@@ -23,7 +23,8 @@ weft.run(app, host='0.0.0.0', port=8000)
 ```
 
 HTTP/1.1, HTTP/2, HTTP/3, WebSocket and WebTransport. TLS, static files,
-compression, a response cache, and Prometheus. ACME is left to Caddy.
+compression, a response cache, Prometheus, and IETF resumable uploads
+(draft-ietf-httpbis-resumable-upload). ACME is left to Caddy.
 
 **Further reading:** [ARCHITECTURE.md](https://github.com/grepjava/weft/blob/master/ARCHITECTURE.md) — how it is built.
 [BENCHMARKS.md](https://github.com/grepjava/weft/blob/master/BENCHMARKS.md) — Weft, Peregrine and Granian on the-benchmarker
@@ -136,13 +137,16 @@ Supported: ASGI 3.0 HTTP (spec 2.4), WebSocket and lifespan; WSGI (PEP
 HTTP/3 over QUIC; WebTransport (ASGI `webtransport.*`); TCP and unix
 sockets; TLS (rustls). ACME is left to the reverse proxy (Caddy).
 
-`weft.contrib` has the framework helpers a WebTransport or HTTP/3 app
-usually writes once: `WebTransportRouter` (Starlette `{name}` / Django
-`<int:pk>` paths), `WebTransportEndpoint`, `AltSvcMiddleware`,
-`weft.webtransport.WebTransportSession`, and IETF resumable uploads
-(`ResumableUploads`). Starlette, FastAPI and Django serve HTTP/3 unchanged;
-the routers exist because those frameworks assert on `scope["type"]` before
-they would see a `webtransport` session.
+`weft.contrib.ResumableUploads` is the IETF resumable upload protocol
+(interop 9): a 104 before the body is read, HEAD for the offset, PATCH to
+append, DELETE to cancel. A client that does not send `Upload-Complete`
+gets an ordinary upload. `weft.contrib` also has the framework helpers a
+WebTransport or HTTP/3 app usually writes once: `WebTransportRouter`
+(Starlette `{name}` / Django `<int:pk>` paths), `WebTransportEndpoint`,
+`AltSvcMiddleware`, and `weft.webtransport.WebTransportSession`.
+Starlette, FastAPI and Django serve HTTP/3 unchanged; the routers exist
+because those frameworks assert on `scope["type"]` before they would see
+a `webtransport` session.
 
 ## Tests
 
