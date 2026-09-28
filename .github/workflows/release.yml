@@ -18,7 +18,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [x86_64, aarch64]
+        include:
+          - target: x86_64
+            manylinux: auto
+          # ring's ARM asm needs a GCC new enough to define __ARM_ARCH.
+          # manylinux2014 (auto on aarch64) is GCC 4.8 and fails the build.
+          - target: aarch64
+            manylinux: '2_28'
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -28,9 +34,11 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist --find-interpreter
+          # CPython only: --find-interpreter also picks up PyPy, which does
+          # not have PyTuple_GET_* / vectorcall.
+          args: --release --out dist -i 3.10 -i 3.11 -i 3.12 -i 3.13 -i 3.14 -i 3.14t
           sccache: 'true'
-          manylinux: auto
+          manylinux: ${{ matrix.manylinux }}
       - uses: actions/upload-artifact@v6
         with:
           name: wheels-linux-${{ matrix.target }}
@@ -51,7 +59,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist --find-interpreter
+          args: --release --out dist -i 3.10 -i 3.11 -i 3.12 -i 3.13 -i 3.14 -i 3.14t
           sccache: 'true'
           manylinux: musllinux_1_2
       - uses: actions/upload-artifact@v6
