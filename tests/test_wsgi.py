@@ -240,3 +240,32 @@ def test_cli(tmp_path):
 
     with serve_process('tests.apps.wsgi_app:app') as (url, _):
         assert httpx.get(url + '/').text == 'Hello, world!'
+
+
+def test_many_keep_alive_clients_get_their_own_responses(wsgi):
+    """More connections than a flush batch holds, each a run of requests:
+    every response is sent, to its own client, in order, without waiting."""
+    import threading
+    import time
+
+    errors = []
+
+    def client(n):
+        try:
+            with httpx.Client(timeout=5.0) as c:
+                for k in range(30):
+                    body = f'{n}-{k}'.encode()
+                    r = c.post(wsgi + '/echo', content=body)
+                    if r.content != body:
+                        errors.append((n, k, r.content))
+        except Exception as e:  # noqa: BLE001
+            errors.append((n, repr(e)))
+
+    t = time.monotonic()
+    threads = [threading.Thread(target=client, args=(n,)) for n in range(40)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(30)
+    assert not errors, errors[:5]
+    assert time.monotonic() - t < 20

@@ -171,6 +171,9 @@ pub struct Shared {
     /// at the start of the next `select`, where waking a task is a push onto
     /// the local run queue rather than a syscall to unpark the driver.
     deferred: RefCell<Vec<Waker>>,
+    /// Connections whose finished response waits for the end of this batch
+    /// of ready tasks (`http::flush_soon`), as slot and generation.
+    pub soon: RefCell<Vec<(u32, u32)>>,
     main_waker: RefCell<Option<Waker>>,
     app: RefCell<Option<Rc<AppCtx>>>,
     pub conns: RefCell<Slab<Rc<Conn>>>,
@@ -298,6 +301,20 @@ impl Shared {
         }
     }
 
+    /// Queues a connection for `http::run_flush_soon`; how many are queued.
+    /// The first wakes the `select` future, which the runtime polls again
+    /// once the tasks ready now have run: that is where the batch ends.
+    pub fn queue_flush(&self, slot: u32, generation: u32) -> usize {
+        let mut q = self.soon.borrow_mut();
+        q.push((slot, generation));
+        if q.len() == 1
+            && let Some(w) = self.main_waker.borrow().as_ref()
+        {
+            w.wake_by_ref();
+        }
+        q.len()
+    }
+
     #[inline]
     pub fn defer_wake(&self, w: Waker) {
         self.deferred.borrow_mut().push(w);
@@ -414,6 +431,7 @@ impl Core {
             sh: Rc::new(Shared {
                 regs: RefCell::new(HashMap::new()),
                 deferred: RefCell::new(Vec::new()),
+                soon: RefCell::new(Vec::new()),
                 main_waker: RefCell::new(None),
                 app: RefCell::new(None),
                 conns: RefCell::new(Slab::with_capacity(256)),
@@ -459,6 +477,7 @@ impl Core {
             let mut yielded = pin!(tokio::task::yield_now());
             let mut spins = 0u32;
             std::future::poll_fn(|cx| {
+                crate::http::run_flush_soon(&sh);
                 sh.run_deferred();
                 {
                     let mut w = sh.main_waker.borrow_mut();

@@ -964,10 +964,15 @@ async fn respond(sh: &Shared, ctx: &AppCtx, conn: &Conn, sr: &PyRef, r: &PyRef) 
             return Next::Close;
         }
     }
+    let next = next_request(sh, conn);
+    // A connection kept alive sends with the batch; one closing sends now.
+    if matches!(next, Next::KeepAlive) && http::flush_soon(sh, conn) {
+        return next;
+    }
     if !flush_all(ctx, conn).await {
         return Next::Close;
     }
-    next_request(sh, conn)
+    next
 }
 
 // --- the thread pool -----------------------------------------------------------------

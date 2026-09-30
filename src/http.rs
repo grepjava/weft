@@ -223,6 +223,8 @@ pub struct State {
     pub cache_variant: u64,
     pub cache_ok: bool,
     pub mutating: bool,
+    /// Queued with `flush_soon` and not yet flushed.
+    pub flush_queued: bool,
     pub h2: bool,
     pub h3: bool,
     pub started: tokio::time::Instant,
@@ -262,6 +264,7 @@ impl State {
             cache_target: 0,
             cache_variant: 0,
             cache_ok: false,
+            flush_queued: false,
             mutating: false,
             h2: false,
             h3: false,
@@ -759,6 +762,70 @@ pub fn flush(io: &Io, out: &mut BytesMut) -> io::Result<bool> {
         }
     }
     io.flush_tls_only()
+}
+
+/// Finished responses held for the end of the batch before they go out
+/// anyway: holding one costs its client the time the ones after it take.
+const FLUSH_BATCH: usize = 16;
+
+/// Sends a finished response together with the others finishing in the same
+/// batch of ready connections, rather than on its own. A write wakes the
+/// client reading the other end; written one at a time between applications,
+/// each finds its reader asleep and pays a cross-CPU wakeup, where written
+/// back to back the ones after the first find it awake. `false` when the
+/// caller must flush now: not a plain HTTP/1 socket, a file still to send,
+/// or more than a small response.
+pub fn flush_soon(sh: &Shared, conn: &Conn) -> bool {
+    let mut st = conn.st.borrow_mut();
+    if conn.io.borrow().is_none()
+        || st.disconnected
+        || st.send_file.is_some()
+        || st.out.len() >= CORK_LIMIT
+    {
+        return false;
+    }
+    if st.flush_queued || st.out.is_empty() {
+        return true;
+    }
+    st.flush_queued = true;
+    drop(st);
+    if sh.queue_flush(conn.slot, conn.generation) >= FLUSH_BATCH {
+        run_flush_soon(sh);
+    }
+    true
+}
+
+/// Sends what `flush_soon` holds: at the end of the batch, or once
+/// `FLUSH_BATCH` are waiting. What the socket will not take at once is left
+/// to a task of its own.
+pub fn run_flush_soon(sh: &Shared) {
+    let queued = std::mem::take(&mut *sh.soon.borrow_mut());
+    for (slot, generation) in queued {
+        let Some(conn) = sh.conn(slot, generation) else {
+            continue;
+        };
+        let rest = {
+            let mut st = conn.st.borrow_mut();
+            st.flush_queued = false;
+            if st.disconnected || conn.io.borrow().is_none() {
+                false
+            } else {
+                match flush(&conn.io(), &mut st.out) {
+                    Ok(done) => !done,
+                    Err(_) => {
+                        st.disconnected = true;
+                        st.out.clear();
+                        false
+                    }
+                }
+            }
+        };
+        if rest && let Some(ctx) = sh.app() {
+            tokio::task::spawn_local(async move {
+                let _ = flush_all(&ctx, &conn).await;
+            });
+        }
+    }
 }
 
 pub fn flush_conn(conn: &Conn) -> io::Result<bool> {
