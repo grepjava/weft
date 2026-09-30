@@ -50,9 +50,10 @@ struct Class {
 /// and the payload after it only through a `SlotGuard`.
 #[repr(C)]
 struct Slot {
-    /// 0 when free; otherwise when it was taken, in Unix milliseconds. A
-    /// worker that dies holding a slot leaves that time behind, and once it
-    /// is `STALE_MS` old the next worker takes the slot over.
+    /// 0 when free; otherwise `lock_token`: the holder's process id and when
+    /// it took the slot. A slot held long enough is taken over only once its
+    /// holder's process is gone: age alone says nothing about a worker that
+    /// is merely paused, and it still has the slot's memory in hand.
     lock: AtomicU64,
     /// Odd while a write is in progress: a slot taken over from a dead
     /// writer is emptied rather than read half written.
@@ -77,8 +78,42 @@ struct SlotData {
 /// Attempts at a busy slot before it is treated as unavailable. A holder
 /// copies at most one object, so this is only reached when one is stuck.
 const LOCK_TRIES: u32 = 4096;
-/// A slot held this long belongs to a worker that died holding it.
+/// A slot held this long is worth asking whether its holder still exists.
 const STALE_MS: u64 = 2000;
+
+/// The holder's process id, then the low 32 bits of the Unix milliseconds
+/// when it took the slot. Never 0.
+fn lock_token(pid: u32, now: u64) -> u64 {
+    (u64::from(pid.max(1)) << 32) | u64::from(now as u32)
+}
+
+/// Whether process `pid` is still running. When that cannot be told, it is
+/// taken to be: a slot wrongly left busy costs a miss, one wrongly taken over
+/// could be written by two workers at once.
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    let r = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    r == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, GetLastError};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    const STILL_ACTIVE: u32 = 259;
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return GetLastError() != ERROR_INVALID_PARAMETER;
+        }
+        let mut code = 0u32;
+        let ok = GetExitCodeProcess(h, &mut code);
+        CloseHandle(h);
+        ok == 0 || code == STILL_ACTIVE
+    }
+}
 
 struct SlotGuard {
     slot: &'static Slot,
@@ -92,14 +127,23 @@ impl SlotGuard {
     /// clock, in Unix milliseconds.
     fn lock(t: &'static Table, c: Class, i: usize, now: u64) -> Option<SlotGuard> {
         let slot = unsafe { &*slot_at(t, c, i) };
-        let token = now.max(1);
+        let me = std::process::id();
+        let token = lock_token(me, now);
+        let mut asked = false;
         for n in 0..LOCK_TRIES {
             let cur = slot.lock.load(Ordering::Relaxed);
-            let stale = cur != 0 && token.saturating_sub(cur) > STALE_MS;
-            if (cur == 0 || stale)
+            let mut orphaned = false;
+            if cur != 0 && !asked && u64::from((now as u32).wrapping_sub(cur as u32)) > STALE_MS {
+                // Once per call: it is a system call. A thread of this
+                // process never dies holding a slot; the guard releases it.
+                asked = true;
+                let owner = (cur >> 32) as u32;
+                orphaned = owner != me && !process_alive(owner);
+            }
+            if (cur == 0 || orphaned)
                 && slot
                     .lock
-                    .compare_exchange_weak(cur, token, Ordering::Acquire, Ordering::Relaxed)
+                    .compare_exchange(cur, token, Ordering::Acquire, Ordering::Relaxed)
                     .is_ok()
             {
                 let mut g = SlotGuard {
@@ -108,7 +152,7 @@ impl SlotGuard {
                     payload: unsafe { t.base.add(c.off + i * c.slot + META) },
                     len: c.payload,
                 };
-                if stale && slot.seq.load(Ordering::Relaxed) & 1 == 1 {
+                if orphaned && slot.seq.load(Ordering::Relaxed) & 1 == 1 {
                     g.data().hash = 0;
                     slot.seq.fetch_add(1, Ordering::Relaxed);
                 }
@@ -139,8 +183,8 @@ impl SlotGuard {
 
 impl Drop for SlotGuard {
     fn drop(&mut self) {
-        // Only if it is still ours: a slot taken over is released by the
-        // worker that took it.
+        // Only if it is still ours, which it always is: a slot is taken over
+        // only from a process that no longer exists.
         let _ =
             self.slot
                 .lock
@@ -912,7 +956,8 @@ cache-control: max-age=60
         let k = put(b"/busy", b"busy");
         let slot = slot_of(&k);
         // A live worker holding the slot.
-        slot.lock.store(now_ms(), Ordering::Relaxed);
+        slot.lock
+            .store(lock_token(std::process::id(), now_ms()), Ordering::Relaxed);
         let t = std::time::Instant::now();
         assert!(lookup(&k, 0, None).is_none());
         assert!(t.elapsed() < std::time::Duration::from_millis(500));
@@ -924,13 +969,34 @@ cache-control: max-age=60
         assert!(lookup(&k, 0, None).is_none());
     }
 
+    /// A process that has already exited.
+    fn dead_pid() -> u32 {
+        let mut child = if cfg!(windows) {
+            std::process::Command::new("cmd")
+                .args(["/C", "exit"])
+                .spawn()
+        } else {
+            std::process::Command::new("true").spawn()
+        }
+        .unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    fn long_ago() -> u64 {
+        now_ms() - STALE_MS - 1000
+    }
+
     #[test]
+    #[cfg_attr(miri, ignore = "spawns processes")]
     fn slot_of_a_dead_worker_is_taken_over() {
         let _serial = table();
+        let dead = dead_pid();
         let k = put(b"/dead-reader", b"intact");
         let slot = slot_of(&k);
         slot.lock
-            .store(now_ms() - STALE_MS - 1000, Ordering::Relaxed);
+            .store(lock_token(dead, long_ago()), Ordering::Relaxed);
         assert_eq!(lookup(&k, 0, None).expect("hit").body, b"intact");
         assert_eq!(slot.lock.load(Ordering::Relaxed), 0);
 
@@ -939,11 +1005,42 @@ cache-control: max-age=60
         // Died part way through a write.
         slot.seq.fetch_add(1, Ordering::Relaxed);
         slot.lock
-            .store(now_ms() - STALE_MS - 1000, Ordering::Relaxed);
+            .store(lock_token(dead, long_ago()), Ordering::Relaxed);
         assert!(lookup(&k, 0, None).is_none());
         assert_eq!(slot.seq.load(Ordering::Relaxed) & 1, 0);
         put(b"/dead-writer", b"again");
         assert_eq!(lookup(&k, 0, None).expect("hit").body, b"again");
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "spawns processes")]
+    fn slot_of_a_paused_worker_is_left_alone() {
+        let _serial = table();
+        let mut other = if cfg!(windows) {
+            std::process::Command::new("ping")
+                .args(["-n", "30", "127.0.0.1"])
+                .stdout(std::process::Stdio::null())
+                .spawn()
+        } else {
+            std::process::Command::new("sleep").arg("30").spawn()
+        }
+        .unwrap();
+        let k = put(b"/paused", b"mine");
+        let slot = slot_of(&k);
+        // Held for long past STALE_MS, by a worker that still exists: in
+        // another process, then in this one.
+        for pid in [other.id(), std::process::id()] {
+            let held = lock_token(pid, long_ago());
+            slot.lock.store(held, Ordering::Relaxed);
+            assert!(lookup(&k, 0, None).is_none());
+            assert_eq!(slot.lock.load(Ordering::Relaxed), held);
+        }
+        slot.lock
+            .store(lock_token(other.id(), long_ago()), Ordering::Relaxed);
+        let _ = other.kill();
+        let _ = other.wait();
+        // Gone now: the slot is taken over and the copy is intact.
+        assert_eq!(lookup(&k, 0, None).expect("hit").body, b"mine");
     }
 
     #[test]
