@@ -646,11 +646,45 @@ fn parse_u32(v: &[u8]) -> Option<u32> {
     String::from_utf8_lossy(v).parse().ok()
 }
 
+/// An IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`) as Unix milliseconds.
+/// The obsolete forms are not read: without a Date the application's Age
+/// alone ages the response (RFC 9111 4.2.3).
 fn parse_http_date(v: &[u8]) -> Option<u64> {
-    // Prefer not to parse every IMF-fixdate here; Age + Date math uses the
-    // application's Age when Date is missing. A correct Date is optional.
-    let _ = v;
-    None
+    let v = trim(v);
+    if v.len() != 29 || &v[3..5] != b", " || &v[25..] != b" GMT" {
+        return None;
+    }
+    let num = |s: &[u8]| -> Option<u64> {
+        s.iter().try_fold(0u64, |n, &c| {
+            c.is_ascii_digit().then(|| n * 10 + u64::from(c - b'0'))
+        })
+    };
+    const MONTHS: [&[u8; 3]; 12] = [
+        b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun", b"Jul", b"Aug", b"Sep", b"Oct", b"Nov",
+        b"Dec",
+    ];
+    let day = num(&v[5..7])?;
+    let month = MONTHS.iter().position(|m| &v[8..11] == m.as_slice())? as u64 + 1;
+    let year = num(&v[12..16])?;
+    if v[7] != b' ' || v[11] != b' ' || v[16] != b' ' || v[19] != b':' || v[22] != b':' {
+        return None;
+    }
+    let (h, m, s) = (num(&v[17..19])?, num(&v[20..22])?, num(&v[23..25])?);
+    if !(1..=31).contains(&day) || year < 1970 || h > 23 || m > 59 || s > 60 {
+        return None;
+    }
+    // Days since 1970-01-01 in the proleptic Gregorian calendar.
+    let (y, mp) = if month > 2 {
+        (year, month - 3)
+    } else {
+        (year - 1, month + 9)
+    };
+    let era = y / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = (era * 146_097 + doe).checked_sub(719_468)?;
+    Some((days * 86_400 + h * 3600 + m * 60 + s) * 1000)
 }
 
 pub struct Capture {
@@ -792,6 +826,33 @@ mod tests {
             response_ok(200, b"cache-control: private, max-age=60\r\n", 2, 1024, 300).is_none()
         );
         assert!(response_ok(200, b"cache-control: max-age=60\r\n", 2, 1024, 300).is_some());
+    }
+
+    #[test]
+    fn http_date() {
+        assert_eq!(
+            parse_http_date(b"Sun, 06 Nov 1994 08:49:37 GMT"),
+            Some(784_111_777_000)
+        );
+        assert_eq!(parse_http_date(b"Thu, 01 Jan 1970 00:00:00 GMT"), Some(0));
+        assert_eq!(
+            parse_http_date(b"Tue, 29 Feb 2000 23:59:59 GMT"),
+            Some(951_868_799_000)
+        );
+        assert_eq!(parse_http_date(b"Sunday, 06-Nov-94 08:49:37 GMT"), None);
+        assert_eq!(parse_http_date(b"Sun, 06 Foo 1994 08:49:37 GMT"), None);
+        assert_eq!(parse_http_date(b"Sun, 06 Nov 1994 08:49:37 UTC"), None);
+    }
+
+    #[test]
+    fn date_ages_the_response() {
+        let stale = b"date: Sat, 01 Jan 2000 00:00:00 GMT\r\ncache-control: max-age=60\r\n";
+        assert!(response_ok(200, stale, 2, 1024, 300).is_none());
+        let mut fresh = b"date: ".to_vec();
+        fresh.extend_from_slice(&crate::http::format_date(now_ms() / 1000));
+        fresh.extend_from_slice(b"\r\ncache-control: max-age=60\r\n");
+        let p = response_ok(200, &fresh, 2, 1024, 300).expect("fresh response is stored");
+        assert!(p.ttl > 55 && p.age < 5);
         assert!(
             response_ok(
                 200,
