@@ -362,9 +362,21 @@ def _run_supervisor(config: Config, sock, n: int) -> int:
             p.join(2)
         raise RuntimeError(f'worker {i} did not start serving')
 
+    slots: list[_Slot] = []
     try:
-        slots = [spawn(i) for i in range(n)]
-    except RuntimeError as e:
+        for i in range(n):
+            slots.append(spawn(i))
+    except BaseException as e:
+        # The workers that did start are serving: stop them before giving up.
+        for slot in slots:
+            slot.stop.set()
+        for slot in slots:
+            slot.proc.join(config.graceful_timeout + 5)
+            if slot.proc.is_alive():
+                slot.proc.terminate()
+                slot.proc.join(2)
+        if not isinstance(e, RuntimeError):
+            raise
         logger.error('%s', e)
         return 3
 

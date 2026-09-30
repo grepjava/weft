@@ -329,3 +329,49 @@ def test_cli_version():
 
     out = subprocess.run([sys.executable, '-m', 'weft', '--version'], capture_output=True, text=True)
     assert out.stdout.startswith('weft ')
+
+
+def test_supervisor_stops_started_workers_when_a_later_one_fails(monkeypatch):
+    import multiprocessing
+
+    from weft import server
+
+    procs = []
+
+    class Proc:
+        def __init__(self, target, args, name):
+            self.stop, self.ready, self.index = args[2], args[4], args[5]
+            self.alive = False
+            self.exitcode = None
+            self.pid = 1000 + self.index
+            procs.append(self)
+
+        def start(self):
+            self.alive = True
+            if self.index == 0:
+                self.ready.set()
+            else:
+                self.alive = False
+                self.exitcode = 1
+
+        def is_alive(self):
+            return self.alive
+
+        def join(self, timeout=None):
+            if self.stop.is_set():
+                self.alive = False
+                self.exitcode = 0
+
+        def terminate(self):
+            self.alive = False
+
+    class Ctx:
+        Event = threading.Event
+        Process = Proc
+
+    monkeypatch.setattr(multiprocessing, 'get_context', lambda method: Ctx)
+    code = server._run_supervisor(Config(app='tests.apps.basic:app', workers=2), None, 2)
+    assert code == 3
+    assert len(procs) == 2
+    assert procs[0].stop.is_set()
+    assert not procs[0].alive
