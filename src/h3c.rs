@@ -690,7 +690,7 @@ async fn drive(
     let limit = ctx.request_timeout.unwrap_or(Duration::from_secs(30));
     let body_limit = ctx.request_timeout.unwrap_or(Duration::from_secs(86_400));
     loop {
-        let want_body = {
+        let (want_body, paused) = {
             let mut st = conn.st.borrow_mut();
             if !st.body.done
                 && !st.rejected
@@ -709,11 +709,9 @@ async fn drive(
                 wake_http_recv(conn);
                 return;
             }
-            !st.body.done
-                && !st.rejected
-                && !st.disconnected
-                && !body.ended()
-                && st.body.buf.len() < http::BODY_HWM
+            let open = !st.body.done && !st.rejected && !st.disconnected && !body.ended();
+            let room = st.body.buf.len() < http::BODY_HWM;
+            (open && room, open && !room)
         };
         if flush_h3(conn).await.is_err() {
             conn.st.borrow_mut().disconnected = true;
@@ -732,10 +730,13 @@ async fn drive(
         let notified = std::future::poll_fn(|cx| {
             conn.set_waker(cx);
             let st = conn.st.borrow();
+            // Reading stopped at BODY_HWM resumes once `receive` has
+            // taken enough of the body.
             if st.disconnected
                 || !st.out.is_empty()
                 || st.send_file.is_some()
                 || st.resp.phase == Phase::Done
+                || (paused && st.body.buf.len() < http::BODY_HWM)
             {
                 std::task::Poll::Ready(())
             } else {

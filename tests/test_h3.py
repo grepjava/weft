@@ -240,3 +240,29 @@ def test_http3_large_static_file(tmp_path):
         assert status == 200
         assert len(body) == len(data)
         assert body == data
+
+
+def test_http3_upload_resumes_after_backpressure(tmp_path):
+    """The body stops being read at the server's high-water mark while the
+    application is busy, and resumes once it takes what was read."""
+
+    async def late_reader(scope, receive, send):
+        await asyncio.sleep(0.4)
+        n = 0
+        while True:
+            m = await receive()
+            if m['type'] != 'http.request':
+                return
+            n += len(m['body'])
+            if not m['more_body']:
+                break
+        await send({'type': 'http.response.start', 'status': 200, 'headers': []})
+        await send({'type': 'http.response.body', 'body': str(n).encode()})
+
+    size = 1024 * 1024
+    cert, key = _cert(tmp_path, 'localhost')
+    with serve_thread(late_reader, lifespan='off', tls_certs=[str(cert)], tls_keys=[str(key)], http3=True) as url:
+        port = int(url.rsplit(':', 1)[1])
+        status, _, body = run(h3_request(port, 'POST', '/', body=b'u' * size))
+        assert status == 200
+        assert body == str(size).encode()
