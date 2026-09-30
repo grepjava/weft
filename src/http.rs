@@ -455,6 +455,7 @@ impl State {
                 variant: self.cache_variant,
                 status,
                 head: self.resp.head.clone(),
+                length: self.resp.info.length,
                 body: Vec::new(),
                 max_object: cfg.max_object,
                 ttl_max: cfg.ttl_max,

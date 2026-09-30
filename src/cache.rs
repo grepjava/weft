@@ -805,6 +805,9 @@ pub struct Capture {
     pub variant: u64,
     pub status: u16,
     pub head: Vec<u8>,
+    /// The `Content-Length` the head declared: a body of any other size
+    /// was clipped or cut short on the wire, and is not what was served.
+    pub length: Option<u64>,
     pub body: Vec<u8>,
     pub max_object: usize,
     pub ttl_max: u64,
@@ -820,6 +823,9 @@ impl Capture {
     }
 
     pub fn finish(self) {
+        if self.length.is_some_and(|n| n != self.body.len() as u64) {
+            return;
+        }
         let Some(p) = response_ok(
             self.status,
             &self.head,

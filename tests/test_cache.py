@@ -18,6 +18,22 @@ def test_fresh_is_cached():
         assert 'age' in b.headers
 
 
+def test_mis_sized_body_not_cached():
+    """The cache holds what went out on the wire: a body longer or shorter
+    than its declared Content-Length is not stored."""
+    cache_app.HITS.clear()
+    with serve_thread(cache_app.app, cache_size=8) as url:
+        for _ in range(2):
+            out = raw(url, b'GET /overlong HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n')
+            assert out.endswith(b'\r\n\r\nabc')
+            assert b'SECRET' not in out
+        assert cache_app.HITS['/overlong'] == 2
+        for _ in range(2):
+            out = raw(url, b'GET /incomplete HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n')
+            assert b'content-length: 100' in out.lower()
+        assert cache_app.HITS['/incomplete'] == 2
+
+
 def test_private_not_cached():
     cache_app.HITS.clear()
     with serve_thread(cache_app.app, cache_size=8) as url:

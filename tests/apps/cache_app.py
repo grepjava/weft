@@ -52,6 +52,16 @@ async def app(scope, receive, send):
         await send({'type': 'http.response.start', 'status': 404, 'headers': headers})
         await send({'type': 'http.response.body', 'body': b'gone'})
         return
+    if path in ('/overlong', '/incomplete'):
+        # Declares a length the body does not match: the wire gets the
+        # declared bytes (or a cut-short response), never the rest.
+        HITS[path] += 1
+        declared = b'3' if path == '/overlong' else b'100'
+        headers = [(b'content-type', b'text/plain'), (b'cache-control', b'max-age=60'),
+                   (b'content-length', declared)]
+        await send({'type': 'http.response.start', 'status': 200, 'headers': headers})
+        await send({'type': 'http.response.body', 'body': b'abcSECRET'})
+        return
     if path == '/hits':
         q = scope.get('query_string') or b'/fresh'
         body = b'%d' % HITS.get(q.decode(), 0)
