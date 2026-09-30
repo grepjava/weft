@@ -39,6 +39,24 @@ PATHS = {
 }
 
 
+def interpreter_pid(pid: int) -> int:
+    """The process running the server's Python. On Windows a venv's
+    python.exe is a launcher that runs the base interpreter as its child."""
+    if os.name != 'nt':
+        return pid
+    import psutil
+
+    try:
+        proc = psutil.Process(pid)
+        if Path(proc.exe()).parent.parent.joinpath('pyvenv.cfg').exists():
+            kids = [c for c in proc.children() if Path(c.exe()).name.lower().startswith('python')]
+            if len(kids) == 1:
+                return kids[0].pid
+    except psutil.Error:
+        pass
+    return pid
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument('--label', required=True)
@@ -50,6 +68,8 @@ def main() -> int:
     ap.add_argument('--rate', type=int, default=None)
     ap.add_argument('--port', type=int, default=8399)
     ap.add_argument('--rate-hz', type=int, default=200, help='py-spy sampling rate')
+    ap.add_argument('--python-only', action='store_true',
+                    help='sample without pausing the process (py-spy --nonblocking), with no native frames')
     ap.add_argument('--cpu-affinity', default=None)
     ap.add_argument('--oha-affinity', default=None)
     args = ap.parse_args()
@@ -95,7 +115,10 @@ def main() -> int:
 
         method, path, extra = PATHS[args.scenario]
         url = f'http://127.0.0.1:{args.port}{path}'
-        oha = ['oha', '--no-tui', '--output-format', 'json', '-z', f'{args.duration + 4}s',
+        # Load covers the warmup and both captures, which run one after the
+        # other, with a margin for py-spy attaching and writing out.
+        load_s = 2 + 2 * args.duration + 6
+        oha = ['oha', '--no-tui', '--output-format', 'json', '-z', f'{load_s}s',
                '-c', str(args.concurrency), '-m', method, *extra, url]
         if args.rate:
             oha += ['-q', str(args.rate), '--latency-correction']
@@ -110,23 +133,39 @@ def main() -> int:
         time.sleep(2.0)  # let it reach steady state before sampling
 
         base = OUT / f'{args.label}-{args.scenario}'
-        spy = [
-            'py-spy', 'record', '--pid', str(server.pid), '--subprocesses', '--native',
-            '--nonblocking', '--rate', str(args.rate_hz), '--duration', str(args.duration),
-            '--format', 'speedscope', '--output', str(base.with_suffix('.speedscope.json')),
-        ]
-        print('py-spy:', ' '.join(spy), flush=True)
-        subprocess.run(spy, check=False)
-        spy[-3:] = ['--format', 'raw', '--output', str(base.with_suffix('.folded'))]
-        subprocess.run(spy, check=False)
+        target_pid = interpreter_pid(server.pid)
+        written = []
+        for fmt, suffix in (('speedscope', '.speedscope.json'), ('raw', '.folded')):
+            target = base.with_suffix(suffix)
+            # py-spy refuses --native with --nonblocking (native frames need
+            # the process paused while it is sampled), and on Windows with
+            # --subprocesses. One worker runs in the server process itself.
+            mode = ['--nonblocking'] if args.python_only else ['--native']
+            if args.workers > 1:
+                mode.append('--subprocesses')
+            spy = [
+                'py-spy', 'record', '--pid', str(target_pid), *mode,
+                '--rate', str(args.rate_hz), '--duration', str(args.duration),
+                '--format', fmt, '--output', str(target),
+            ]
+            print('py-spy:', ' '.join(spy), flush=True)
+            if subprocess.run(spy, check=False).returncode == 0 and target.exists():
+                written.append(target)
+            else:
+                print(f'py-spy failed to write {target}', file=sys.stderr)
+        if load.poll() is not None:
+            print('warning: the load ended before the captures did', file=sys.stderr)
 
-        out, _ = load.communicate(timeout=60)
+        out, _ = load.communicate(timeout=load_s + 60)
         try:
             summary = json.loads(out).get('summary', {})
-            print(f"load: {summary.get('requestsPerSec', 0):.0f} req/s over {args.duration + 4}s", flush=True)
+            print(f"load: {summary.get('requestsPerSec', 0):.0f} req/s over {load_s}s", flush=True)
         except Exception:  # noqa: BLE001
             pass
-        print('wrote', base.with_suffix('.folded'), 'and', base.with_suffix('.speedscope.json'))
+        if written:
+            print('wrote', ' and '.join(str(w) for w in written))
+        if len(written) < 2:
+            return 1
     finally:
         server.send_signal(signal.SIGTERM if os.name != 'nt' else signal.SIGTERM)
         try:
