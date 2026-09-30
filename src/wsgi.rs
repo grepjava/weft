@@ -480,7 +480,10 @@ unsafe fn encode_head(status: *mut PyObject, headers: *mut PyObject) -> PResult<
                 "headers must be a list of (name, value) tuples",
             ));
         }
-        let mut info = HeadInfo::default();
+        let mut info = HeadInfo {
+            seen: Some(Default::default()),
+            ..HeadInfo::default()
+        };
         let n = PyList_GET_SIZE(headers);
         for k in 0..n {
             let item = PyList_GET_ITEM(headers, k);
@@ -514,6 +517,9 @@ unsafe fn encode_head(status: *mut PyObject, headers: *mut PyObject) -> PResult<
                 Ok(())
             })?;
             let (name, value) = (&head[start..start + name_len], &head[vstart..]);
+            if let Some(seen) = info.seen.as_mut() {
+                seen.observe(name, value);
+            }
             match name.len() {
                 14 if eq_ci(name, b"content-length") => match parse_len(value) {
                     Some(l) => info.length = Some(l),

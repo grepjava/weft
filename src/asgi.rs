@@ -965,6 +965,9 @@ pub unsafe fn encode_headers(
                 out.truncate(start);
                 continue;
             }
+            if let Some(seen) = info.seen.as_mut() {
+                seen.observe(n, v);
+            }
             match n.len() {
                 14 if eq_ci(n, b"content-length") => match parse_len(v) {
                     Some(l) => info.length = Some(l),
@@ -1048,7 +1051,12 @@ pub unsafe fn http_start(
         head.push(b' ');
         head.extend_from_slice(reason(status));
         head.extend_from_slice(b"\r\n");
-        let mut info = HeadInfo::default();
+        // Every header of this head goes through the encoder: it records
+        // what `write_head` would otherwise parse the head again for.
+        let mut info = HeadInfo {
+            seen: Some(Default::default()),
+            ..HeadInfo::default()
+        };
         if let Some(h) = py::dict_get(msg, i.headers)? {
             encode_headers(h.ptr(), &mut head, &mut info, None)?;
         }

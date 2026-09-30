@@ -239,7 +239,7 @@ pub fn raw_accept(headers: &[httparse::Header<'_>]) -> Vec<u8> {
 }
 
 /// What the response headers say about compressing it.
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 pub struct Eligibility {
     pub compressible_type: bool,
     pub already_encoded: bool,
@@ -266,14 +266,6 @@ impl Eligibility {
             16 if eq_ci(name, b"content-encoding") => self.already_encoded = true,
             _ => {}
         }
-    }
-
-    pub fn from_head(head: &[u8]) -> Eligibility {
-        let mut e = Eligibility::default();
-        for (n, v) in crate::http::header_lines(head) {
-            e.observe(n, v);
-        }
-        e
     }
 
     pub fn may_vary(&self, status: u16) -> bool {

@@ -114,6 +114,40 @@ pub struct HeadInfo {
     pub has_date: bool,
     pub has_server: bool,
     pub has_request_id: bool,
+    /// Filled in by an encoder that saw every header of the head; `None`
+    /// and `write_head` reads them from the head itself.
+    pub seen: Option<Seen>,
+}
+
+/// What a head's own headers say, gathered while they are encoded so that
+/// `write_head` need not parse them again.
+#[derive(Default, Clone, Copy)]
+pub struct Seen {
+    pub elig: crate::compress::Eligibility,
+    pub content_length: bool,
+    pub hsts: bool,
+    pub alt_svc: bool,
+}
+
+impl Seen {
+    #[inline]
+    pub fn observe(&mut self, name: &[u8], value: &[u8]) {
+        self.elig.observe(name, value);
+        match name.len() {
+            14 => self.content_length |= crate::asgi::eq_ci(name, b"content-length"),
+            25 => self.hsts |= crate::asgi::eq_ci(name, b"strict-transport-security"),
+            7 => self.alt_svc |= crate::asgi::eq_ci(name, b"alt-svc"),
+            _ => {}
+        }
+    }
+
+    pub fn scan(head: &[u8]) -> Seen {
+        let mut s = Seen::default();
+        for (n, v) in header_lines(head) {
+            s.observe(n, v);
+        }
+        s
+    }
 }
 
 pub struct Resp {
@@ -426,7 +460,12 @@ impl State {
                 ttl_max: cfg.ttl_max,
             }));
         }
-        let elig = crate::compress::Eligibility::from_head(&self.resp.head);
+        let seen = self
+            .resp
+            .info
+            .seen
+            .unwrap_or_else(|| Seen::scan(&self.resp.head));
+        let elig = seen.elig;
         let no_body = self.head_req || status < 200 || status == 204 || status == 304;
         let offered = if ctx.compress {
             self.accepted
@@ -446,119 +485,106 @@ impl State {
             self.resp.info.chunked = true;
             self.encoder = crate::compress::Encoder::new(coding).map(Box::new);
         }
+        // The head, then what the server adds, straight into the output.
+        let out = &mut self.out;
+        out.reserve(self.resp.head.len() + 192);
+        out.extend_from_slice(&self.resp.head);
         let info = &self.resp.info;
         let mut close = !self.keep_alive || info.close || stopping;
-        let mut extra: Vec<u8> = Vec::with_capacity(160);
         if coding != crate::compress::Coding::Identity {
-            extra.extend_from_slice(b"content-encoding: ");
-            extra.extend_from_slice(coding.token());
-            extra.extend_from_slice(b"\r\n");
+            out.extend_from_slice(b"content-encoding: ");
+            out.extend_from_slice(coding.token());
+            out.extend_from_slice(b"\r\n");
         }
         if elig.may_vary(status) && !elig.vary_covered {
-            extra.extend_from_slice(b"vary: accept-encoding\r\n");
+            out.extend_from_slice(b"vary: accept-encoding\r\n");
         }
         if let Some((age, ttl)) = self.cache_hit {
-            extra.extend_from_slice(b"age: ");
-            push_int(&mut extra, age as u64);
-            extra.extend_from_slice(b"\r\ncache-status: weft; hit; ttl=");
-            push_int(&mut extra, ttl as u64);
-            extra.extend_from_slice(b"\r\n");
+            out.extend_from_slice(b"age: ");
+            push_int(out, age as u64);
+            out.extend_from_slice(b"\r\ncache-status: weft; hit; ttl=");
+            push_int(out, ttl as u64);
+            out.extend_from_slice(b"\r\n");
         }
         let framing = if no_body {
             Framing::NoBody
         } else if self.h2 || self.h3 {
             if let Some(n) = info.length {
-                if !header_lines(&self.resp.head)
-                    .iter()
-                    .any(|(k, _)| crate::asgi::eq_ci(k, b"content-length"))
-                {
-                    extra.extend_from_slice(b"content-length: ");
-                    push_int(&mut extra, n);
-                    extra.extend_from_slice(b"\r\n");
+                if !seen.content_length {
+                    out.extend_from_slice(b"content-length: ");
+                    push_int(out, n);
+                    out.extend_from_slice(b"\r\n");
                 }
                 Framing::Length(n)
             } else if !more {
-                extra.extend_from_slice(b"content-length: ");
-                push_int(&mut extra, first_len as u64);
-                extra.extend_from_slice(b"\r\n");
+                out.extend_from_slice(b"content-length: ");
+                push_int(out, first_len as u64);
+                out.extend_from_slice(b"\r\n");
                 Framing::Length(first_len as u64)
             } else {
                 Framing::Eof
             }
         } else if info.chunked && self.http11 {
-            extra.extend_from_slice(b"transfer-encoding: chunked\r\n");
+            out.extend_from_slice(b"transfer-encoding: chunked\r\n");
             Framing::Chunked
         } else if let Some(n) = info.length {
-            if !header_lines(&self.resp.head)
-                .iter()
-                .any(|(k, _)| crate::asgi::eq_ci(k, b"content-length"))
-            {
-                extra.extend_from_slice(b"content-length: ");
-                push_int(&mut extra, n);
-                extra.extend_from_slice(b"\r\n");
+            if !seen.content_length {
+                out.extend_from_slice(b"content-length: ");
+                push_int(out, n);
+                out.extend_from_slice(b"\r\n");
             }
             Framing::Length(n)
         } else if !more {
-            extra.extend_from_slice(b"content-length: ");
-            push_int(&mut extra, first_len as u64);
-            extra.extend_from_slice(b"\r\n");
+            out.extend_from_slice(b"content-length: ");
+            push_int(out, first_len as u64);
+            out.extend_from_slice(b"\r\n");
             Framing::Length(first_len as u64)
         } else if self.http11 {
-            extra.extend_from_slice(b"transfer-encoding: chunked\r\n");
+            out.extend_from_slice(b"transfer-encoding: chunked\r\n");
             Framing::Chunked
         } else {
             close = true;
             Framing::Eof
         };
         if ctx.date_header && !info.has_date {
-            extra.extend_from_slice(b"date: ");
-            extra.extend_from_slice(date);
-            extra.extend_from_slice(b"\r\n");
+            out.extend_from_slice(b"date: ");
+            out.extend_from_slice(date);
+            out.extend_from_slice(b"\r\n");
         }
         if ctx.server_header && !info.has_server {
-            extra.extend_from_slice(b"server: weft\r\n");
+            out.extend_from_slice(b"server: weft\r\n");
         }
         if !self.request_id.is_empty() && !info.has_request_id {
-            extra.extend_from_slice(b"x-request-id: ");
-            extra.extend_from_slice(&self.request_id);
-            extra.extend_from_slice(b"\r\n");
+            out.extend_from_slice(b"x-request-id: ");
+            out.extend_from_slice(&self.request_id);
+            out.extend_from_slice(b"\r\n");
         }
         if let Some(hsts) = &ctx.hsts
-            && !header_lines(&self.resp.head)
-                .iter()
-                .any(|(k, _)| crate::asgi::eq_ci(k, b"strict-transport-security"))
+            && !seen.hsts
         {
-            extra.extend_from_slice(b"strict-transport-security: ");
-            extra.extend_from_slice(hsts);
-            extra.extend_from_slice(b"\r\n");
+            out.extend_from_slice(b"strict-transport-security: ");
+            out.extend_from_slice(hsts);
+            out.extend_from_slice(b"\r\n");
         }
         if !(self.h2 || self.h3) {
             if close {
                 if !info.close {
-                    extra.extend_from_slice(b"connection: close\r\n");
+                    out.extend_from_slice(b"connection: close\r\n");
                 }
             } else if !self.http11 {
-                extra.extend_from_slice(b"connection: keep-alive\r\n");
+                out.extend_from_slice(b"connection: keep-alive\r\n");
             }
         } else {
             close = false;
         }
         if let Some(port) = ctx.alt_svc
-            && !header_lines(&self.resp.head)
-                .iter()
-                .any(|(k, _)| crate::asgi::eq_ci(k, b"alt-svc"))
-            && !extra
-                .windows(8)
-                .any(|w| w.eq_ignore_ascii_case(b"alt-svc:"))
+            && !seen.alt_svc
         {
-            extra.extend_from_slice(b"alt-svc: h3=\":");
-            push_int(&mut extra, port as u64);
-            extra.extend_from_slice(b"\"; ma=86400\r\n");
+            out.extend_from_slice(b"alt-svc: h3=\":");
+            push_int(out, port as u64);
+            out.extend_from_slice(b"\"; ma=86400\r\n");
         }
-        self.out.reserve(self.resp.head.len() + extra.len() + 2);
-        self.out.extend_from_slice(&self.resp.head);
-        self.out.extend_from_slice(&extra);
-        self.out.extend_from_slice(b"\r\n");
+        out.extend_from_slice(b"\r\n");
         self.resp.head = Vec::new();
         self.resp.framing = framing;
         self.resp.close = close;
