@@ -86,14 +86,6 @@ impl H2Tx {
     }
 }
 
-fn send_reset(tx: &mut H2Tx) {
-    if let Some(mut r) = tx.respond.take() {
-        r.send_reset(h2::Reason::INTERNAL_ERROR);
-    } else if let Some(mut s) = tx.send.take() {
-        s.send_reset(h2::Reason::INTERNAL_ERROR);
-    }
-}
-
 impl H2Tx {
     fn send_head(&mut self, head: &[u8], eos: bool) -> io::Result<bool> {
         let Some(respond) = self.respond.as_mut() else {
@@ -216,22 +208,16 @@ async fn stream(
     peer: SocketAddr,
     unix: bool,
 ) {
-    let (parts, mut body) = req.into_parts();
-    let mut payload = BytesMut::new();
-    while let Some(chunk) = body.data().await {
-        let Ok(chunk) = chunk else { return };
-        let _ = body.flow_control().release_capacity(chunk.len());
-        payload.extend_from_slice(&chunk);
-        if payload.len() as u64 > ctx.max_body {
-            let mut tx = H2Tx::new(respond);
-            send_reset(&mut tx);
-            return;
-        }
-    }
+    let (parts, recv) = req.into_parts();
     let conn = alloc(&sh, peer, unix, respond);
     conn.st.borrow_mut().h2 = true;
-    let mut rbuf = synthesize(&parts, payload.len());
-    rbuf.extend_from_slice(&payload);
+    // The body is read after dispatch, as the application asks for it.
+    let ended = recv.is_end_stream();
+    let (mut rbuf, chunked) = http::synthesize(&parts, ended);
+    let mut body = http::StreamBody::new(recv, chunked);
+    if ended {
+        body.end(&mut rbuf);
+    }
     let mut timer = std::pin::pin!(tokio::time::sleep(std::time::Duration::from_secs(86_400)));
     match asgi::dispatch(&sh, &ctx, &conn, &mut rbuf) {
         asgi::Parsed::Dispatched => {
@@ -241,6 +227,7 @@ async fn stream(
                     since: None,
                     armed: None,
                 },
+                stream_body: Some(body),
             };
             let _ = std::future::poll_fn(|cx| {
                 http::pump(&sh, &ctx, &conn, &mut rbuf, &mut p, timer.as_mut(), cx)
@@ -248,7 +235,9 @@ async fn stream(
             .await;
         }
         asgi::Parsed::Wsgi(environ) => {
-            let _ = crate::wsgi::run(&sh, &ctx, &conn, &mut rbuf, environ).await;
+            if http::read_stream_body(&ctx, &conn, &mut rbuf, &mut body).await {
+                let _ = crate::wsgi::run(&sh, &ctx, &conn, &mut rbuf, environ).await;
+            }
         }
         asgi::Parsed::Answered(_) => {
             let _ = http::flush_all(&ctx, &conn).await;
@@ -292,55 +281,20 @@ fn alloc(sh: &Shared, peer: SocketAddr, unix: bool, respond: SendResponse<Bytes>
     conn
 }
 
-fn synthesize(parts: &::http::request::Parts, body_len: usize) -> BytesMut {
-    let method = parts.method.as_str();
-    let path = parts
-        .uri
-        .path_and_query()
-        .map(|p| p.as_str())
-        .unwrap_or("/");
-    let path = if path.is_empty() { "/" } else { path };
-    let authority = parts
-        .uri
-        .authority()
-        .map(|a| a.as_str().to_string())
-        .or_else(|| {
-            parts
-                .headers
-                .get(::http::header::HOST)
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string())
-        })
-        .unwrap_or_else(|| "localhost".into());
-    let mut out = BytesMut::new();
-    out.extend_from_slice(method.as_bytes());
-    out.extend_from_slice(b" ");
-    out.extend_from_slice(path.as_bytes());
-    out.extend_from_slice(b" HTTP/1.1\r\n");
-    out.extend_from_slice(b"host: ");
-    out.extend_from_slice(authority.as_bytes());
-    out.extend_from_slice(b"\r\n");
-    let mut has_cl = false;
-    for (name, value) in &parts.headers {
-        let n = name.as_str();
-        if n == "host" || n == "transfer-encoding" {
-            continue;
+impl http::BodySource for h2::RecvStream {
+    fn poll_piece(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<Bytes>, ()>> {
+        match self.poll_data(cx) {
+            Poll::Ready(Some(Ok(data))) => {
+                // Credit goes back as the body is taken, so the stream's
+                // window is what holds a fast client back.
+                let _ = self.flow_control().release_capacity(data.len());
+                Poll::Ready(Ok(Some(data)))
+            }
+            Poll::Ready(Some(Err(_))) => Poll::Ready(Err(())),
+            Poll::Ready(None) => Poll::Ready(Ok(None)),
+            Poll::Pending => Poll::Pending,
         }
-        if n == "content-length" {
-            has_cl = true;
-        }
-        out.extend_from_slice(n.as_bytes());
-        out.extend_from_slice(b": ");
-        out.extend_from_slice(value.as_bytes());
-        out.extend_from_slice(b"\r\n");
     }
-    if !has_cl {
-        out.extend_from_slice(b"content-length: ");
-        crate::http::push_int(&mut out, body_len as u64);
-        out.extend_from_slice(b"\r\n");
-    }
-    out.extend_from_slice(b"\r\n");
-    out
 }
 
 #[cfg(test)]
@@ -357,9 +311,26 @@ mod tests {
             .body(())
             .unwrap();
         let parts = req.into_parts().0;
-        let out = synthesize(&parts, 0);
+        let (out, chunked) = http::synthesize(&parts, true);
+        assert!(!chunked);
         let text = String::from_utf8_lossy(&out).to_ascii_lowercase();
         assert!(text.contains("host: example.com"), "{text}");
+    }
+
+    #[test]
+    fn open_stream_without_length_is_chunked() {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/upload")
+            .header("host", "example.com")
+            .body(())
+            .unwrap();
+        let parts = req.into_parts().0;
+        let (out, chunked) = http::synthesize(&parts, false);
+        let text = String::from_utf8_lossy(&out).to_ascii_lowercase();
+        assert!(chunked);
+        assert!(text.contains("transfer-encoding: chunked"), "{text}");
+        assert!(!text.contains("content-length"), "{text}");
     }
 
     #[test]

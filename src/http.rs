@@ -15,7 +15,7 @@ use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use tokio::time::{Instant, Sleep};
 
 use crate::asgi;
@@ -892,6 +892,7 @@ async fn serve(sh: &Shared, ctx: &Rc<AppCtx>, conn: &Rc<Conn>, rbuf: &mut BytesM
                 since: None,
                 armed: None,
             },
+            stream_body: None,
         };
         match poll_fn(|cx| pump(sh, ctx, conn, rbuf, &mut p, timer.as_mut(), cx)).await {
             Next::KeepAlive => {}
@@ -974,6 +975,181 @@ pub async fn read_some(
 pub(crate) struct Pump {
     pub eof: bool,
     pub stall: Stall,
+    /// An HTTP/2 stream's body, which arrives in DATA frames, not from `io`.
+    pub stream_body: Option<StreamBody<h2::RecvStream>>,
+}
+
+/// Where an HTTP/2 or HTTP/3 request body comes from.
+pub(crate) trait BodySource {
+    /// The next piece of the body, `None` once it has ended, `Err` when the
+    /// client reset the stream.
+    fn poll_piece(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<Bytes>, ()>>;
+}
+
+/// An HTTP/2 or HTTP/3 request body, framed into the read buffer the way
+/// `synthesize` announced it, so it is read like an HTTP/1.1 body: after
+/// dispatch, as the application asks for it.
+pub(crate) struct StreamBody<S> {
+    /// `None` once the stream has ended.
+    src: Option<S>,
+    chunked: bool,
+}
+
+impl<S: BodySource> StreamBody<S> {
+    pub fn new(src: S, chunked: bool) -> Self {
+        StreamBody {
+            src: Some(src),
+            chunked,
+        }
+    }
+
+    pub fn ended(&self) -> bool {
+        self.src.is_none()
+    }
+
+    pub fn push(&self, rbuf: &mut BytesMut, data: &[u8]) {
+        if !self.chunked {
+            rbuf.extend_from_slice(data);
+        } else if !data.is_empty() {
+            use std::fmt::Write as _;
+            let _ = write!(rbuf, "{:x}\r\n", data.len());
+            rbuf.extend_from_slice(data);
+            rbuf.extend_from_slice(b"\r\n");
+        }
+    }
+
+    pub fn end(&mut self, rbuf: &mut BytesMut) {
+        if self.chunked && self.src.is_some() {
+            rbuf.extend_from_slice(b"0\r\n\r\n");
+        }
+        self.src = None;
+    }
+
+    /// Frames the next piece into `rbuf`. Ready once there was progress,
+    /// including the end; `Err` when the client reset the stream.
+    pub fn poll_into(&mut self, rbuf: &mut BytesMut, cx: &mut Context<'_>) -> Poll<Result<(), ()>> {
+        let Some(src) = self.src.as_mut() else {
+            return Poll::Ready(Ok(()));
+        };
+        match src.poll_piece(cx) {
+            Poll::Ready(Ok(Some(data))) => {
+                self.push(rbuf, &data);
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Ok(None)) => {
+                self.end(rbuf);
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(())) => {
+                self.src = None;
+                Poll::Ready(Err(()))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// WSGI hands the application the whole body, so an HTTP/2 or HTTP/3
+/// stream's is read before it runs. `false` when the request cannot go on;
+/// any answer the server owes is already queued.
+pub(crate) async fn read_stream_body<S: BodySource>(
+    ctx: &AppCtx,
+    conn: &Conn,
+    rbuf: &mut BytesMut,
+    body: &mut StreamBody<S>,
+) -> bool {
+    let limit = ctx.request_timeout.unwrap_or(Duration::from_secs(86_400));
+    loop {
+        {
+            let mut st = conn.st.borrow_mut();
+            let st = &mut *st;
+            if let Err(status) = st.body.feed(rbuf) {
+                st.reject(status);
+                return false;
+            }
+            if st.body.done {
+                return true;
+            }
+            if body.ended() {
+                // Shorter than its Content-Length.
+                st.disconnected = true;
+                return false;
+            }
+            if st.expect_continue {
+                st.expect_continue = false;
+                st.out.extend_from_slice(b"HTTP/1.1 100 Continue\r\n\r\n");
+            }
+        }
+        if !flush_all(ctx, conn).await {
+            return false;
+        }
+        match tokio::time::timeout(limit, poll_fn(|cx| body.poll_into(rbuf, cx))).await {
+            Ok(Ok(())) => {}
+            Ok(Err(())) => {
+                conn.st.borrow_mut().disconnected = true;
+                return false;
+            }
+            Err(_) => {
+                conn.st.borrow_mut().reject(408);
+                return false;
+            }
+        }
+    }
+}
+
+/// The HTTP/1.1 head an HTTP/2 or HTTP/3 request is dispatched as. A body
+/// without a Content-Length is framed as chunked unless the stream has
+/// already ended; the flag says which.
+pub(crate) fn synthesize(parts: &::http::request::Parts, ended: bool) -> (BytesMut, bool) {
+    let method = parts.method.as_str();
+    let path = parts
+        .uri
+        .path_and_query()
+        .map(|p| p.as_str())
+        .unwrap_or("/");
+    let path = if path.is_empty() { "/" } else { path };
+    let authority = parts
+        .uri
+        .authority()
+        .map(|a| a.as_str().to_string())
+        .or_else(|| {
+            parts
+                .headers
+                .get(::http::header::HOST)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "localhost".into());
+    let mut out = BytesMut::new();
+    out.extend_from_slice(method.as_bytes());
+    out.extend_from_slice(b" ");
+    out.extend_from_slice(path.as_bytes());
+    out.extend_from_slice(b" HTTP/1.1\r\n");
+    out.extend_from_slice(b"host: ");
+    out.extend_from_slice(authority.as_bytes());
+    out.extend_from_slice(b"\r\n");
+    let mut has_cl = false;
+    for (name, value) in &parts.headers {
+        let n = name.as_str();
+        if n == "host" || n == "transfer-encoding" {
+            continue;
+        }
+        if n == "content-length" {
+            has_cl = true;
+        }
+        out.extend_from_slice(n.as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(value.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    let chunked = !has_cl && !ended;
+    if chunked {
+        out.extend_from_slice(b"transfer-encoding: chunked\r\n");
+    } else if !has_cl {
+        out.extend_from_slice(b"content-length: 0\r\n");
+    }
+    out.extend_from_slice(b"\r\n");
+    (out, chunked)
 }
 
 /// `--request-timeout`: how long a request may go without its bytes moving
@@ -1099,6 +1275,26 @@ pub(crate) fn pump(
                 break;
             }
         }
+        // An HTTP/2 stream's body comes in DATA frames, under the same bound;
+        // flow control holds the client back meanwhile.
+        let want_frames = p.stream_body.as_ref().is_some_and(|b| !b.ended())
+            && !st.disconnected
+            && !st.rejected
+            && !st.body.done
+            && st.body.buf.len() < BODY_HWM;
+        if want_frames && let Some(b) = p.stream_body.as_mut() {
+            match b.poll_into(rbuf, cx) {
+                Poll::Ready(Ok(())) => got = true,
+                Poll::Ready(Err(())) => *eof = true,
+                Poll::Pending => {}
+            }
+        } else if !st.body.done
+            && !st.rejected
+            && p.stream_body.as_ref().is_some_and(StreamBody::ended)
+        {
+            // The stream ended short of its Content-Length.
+            *eof = true;
+        }
         // Read until the socket would block, so that Tokio's readiness is
         // cleared and a waker registered; `want_read` bounds the buffering.
         if got || wrote {
@@ -1164,7 +1360,7 @@ pub(crate) fn pump(
         }
 
         if let Some(limit) = ctx.request_timeout {
-            let waiting = !st.out.is_empty() || (want_read && !st.body.done);
+            let waiting = !st.out.is_empty() || ((want_read || want_frames) && !st.body.done);
             if waiting {
                 let now = Instant::now();
                 let at = *p.stall.since.get_or_insert(now) + limit;

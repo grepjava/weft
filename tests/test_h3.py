@@ -179,3 +179,28 @@ def test_http3_wsgi(tmp_path):
         assert body == b'Hello, world!'
         _, _, env = run(h3_request(port, 'GET', '/environ'))
         assert b'HTTP/3' in env
+
+
+def test_http3_dispatches_before_body_ends(tmp_path):
+    from tests.test_h2 import _first_chunk
+
+    async def open_post(port):
+        async with connect('127.0.0.1', port, configuration=configuration(), create_protocol=Client) as client:
+            stream_id = client._quic.get_next_available_stream_id()
+            client._http.send_headers(stream_id, [
+                (b':method', b'POST'), (b':scheme', b'https'),
+                (b':authority', b'localhost'), (b':path', b'/'),
+            ])
+            client._http.send_data(stream_id, b'hello', end_stream=False)
+            client.transmit()
+            for _ in range(500):
+                d = client._done.get(stream_id)
+                if d and d['status'] is not None and d['body']:
+                    return d['status'], d['body']
+                await asyncio.sleep(0.01)
+            raise TimeoutError('the application never saw the first piece of the body')
+
+    cert, key = _cert(tmp_path, 'localhost')
+    with serve_thread(_first_chunk, lifespan='off', tls_certs=[str(cert)], tls_keys=[str(key)], http3=True) as url:
+        port = int(url.rsplit(':', 1)[1])
+        assert run(open_post(port)) == (200, b'hello+')

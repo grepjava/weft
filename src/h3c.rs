@@ -12,7 +12,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::task::Poll;
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use crate::asgi;
@@ -32,19 +32,38 @@ use h3::stream::BufRecvStream;
 use quinn::crypto::rustls::QuicServerConfig;
 
 type H3Stream = RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
+type H3Send = RequestStream<h3_quinn::SendStream<Bytes>, Bytes>;
+type H3Recv = RequestStream<h3_quinn::RecvStream, Bytes>;
 
 pub struct H3Tx {
-    stream: Option<H3Stream>,
+    stream: Option<H3Send>,
+    /// A WebTransport session's capsules; a request's body is read by its
+    /// own task instead.
+    recv: Option<H3Recv>,
     head_sent: bool,
     finished: bool,
 }
 
 impl H3Tx {
-    fn new(stream: H3Stream) -> H3Tx {
+    fn new(stream: H3Send, recv: Option<H3Recv>) -> H3Tx {
         H3Tx {
             stream: Some(stream),
+            recv,
             head_sent: false,
             finished: false,
+        }
+    }
+}
+
+impl http::BodySource for H3Recv {
+    fn poll_piece(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<Bytes>, ()>> {
+        match self.poll_recv_data(cx) {
+            Poll::Ready(Ok(Some(mut chunk))) => {
+                Poll::Ready(Ok(Some(chunk.copy_to_bytes(chunk.remaining()))))
+            }
+            Poll::Ready(Ok(None)) => Poll::Ready(Ok(None)),
+            Poll::Ready(Err(_)) => Poll::Ready(Err(())),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -291,41 +310,32 @@ async fn request(
         let _ = stream.finish().await;
         return;
     }
-    let expected = req
-        .headers()
-        .get(::http::header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok());
-    let mut payload = BytesMut::new();
-    loop {
-        if expected.is_some_and(|n| payload.len() as u64 >= n) {
-            break;
-        }
-        match stream.recv_data().await {
-            Ok(Some(mut chunk)) => {
-                payload.extend_from_slice(chunk.copy_to_bytes(chunk.remaining()).as_ref());
-                if payload.len() as u64 > ctx.max_body {
-                    stream.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
-                    return;
-                }
-            }
-            Ok(None) => break,
-            Err(_) => return,
-        }
-    }
     let parts = req.into_parts().0;
-    let conn = alloc_stream(&sh, peer, stream);
+    let (send, mut recv) = stream.split();
+    // The body is read after dispatch, as the application asks for it. A
+    // stream that ended with its headers has none; one look tells.
+    let first = http::BodySource::poll_piece(&mut recv, &mut Context::from_waker(Waker::noop()));
+    if matches!(first, Poll::Ready(Err(()))) {
+        return;
+    }
+    let ended = matches!(first, Poll::Ready(Ok(None)));
+    let (mut rbuf, chunked) = http::synthesize(&parts, ended);
+    let mut body = http::StreamBody::new(recv, chunked);
+    match first {
+        Poll::Ready(Ok(Some(data))) => body.push(&mut rbuf, &data),
+        Poll::Ready(Ok(None)) => body.end(&mut rbuf),
+        _ => {}
+    }
+    let conn = alloc_stream(&sh, peer, send, None);
     conn.st.borrow_mut().h3 = true;
-    let mut rbuf = synthesize(&parts, payload.len());
-    rbuf.extend_from_slice(&payload);
     match asgi::dispatch(&sh, &ctx, &conn, &mut rbuf) {
         asgi::Parsed::Dispatched => {
-            let _ = conn.st.borrow_mut().body.feed(&mut rbuf);
-            wake_http_recv(&conn);
-            drive(&ctx, &conn).await;
+            drive(&ctx, &conn, &mut rbuf, &mut body).await;
         }
         asgi::Parsed::Wsgi(environ) => {
-            let _ = crate::wsgi::run(&sh, &ctx, &conn, &mut rbuf, environ).await;
+            if http::read_stream_body(&ctx, &conn, &mut rbuf, &mut body).await {
+                let _ = crate::wsgi::run(&sh, &ctx, &conn, &mut rbuf, environ).await;
+            }
         }
         asgi::Parsed::Answered(_) => {
             let _ = http::flush_all(&ctx, &conn).await;
@@ -350,7 +360,9 @@ async fn request(
 fn wake_http_recv(conn: &Conn) {
     let mut st = conn.st.borrow_mut();
     let wake = if st.recv_waiter.is_some() {
-        if !st.final_delivered && (!st.body.buf.is_empty() || st.body.done) {
+        if st.rejected {
+            st.recv_waiter.take().map(|w| (w, None))
+        } else if !st.final_delivered && (!st.body.buf.is_empty() || st.body.done) {
             let data = st.body.buf.split();
             let more = !st.body.done;
             st.final_delivered = !more;
@@ -406,8 +418,9 @@ async fn webtransport(
     let session_id = wt::session_id_from_connect(stream.id().into_inner());
     let session = wt::Session::new(session_id);
     let parts = req.into_parts().0;
-    let rbuf = synthesize(&parts, 0);
-    let conn = alloc_stream(&sh, peer, stream);
+    let (rbuf, _) = http::synthesize(&parts, true);
+    let (send, recv) = stream.split();
+    let conn = alloc_stream(&sh, peer, send, Some(recv));
     conn.st.borrow_mut().h3 = true;
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let mut parsed = httparse::Request::new(&mut headers);
@@ -519,7 +532,7 @@ async fn recv_capsule(conn: &Conn) -> Result<Option<Bytes>, ()> {
     let Some(tx) = hold.tx.as_mut() else {
         return std::future::pending().await;
     };
-    if let Some(s) = tx.stream.as_mut() {
+    if let Some(s) = tx.recv.as_mut() {
         match s.recv_data().await {
             Ok(Some(mut chunk)) => Ok(Some(chunk.copy_to_bytes(chunk.remaining()))),
             Ok(None) => Ok(None),
@@ -657,13 +670,34 @@ fn parse_extra_headers(extra: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
     headers
 }
 
-async fn drive(ctx: &AppCtx, conn: &Conn) {
+async fn drive(
+    ctx: &AppCtx,
+    conn: &Conn,
+    rbuf: &mut BytesMut,
+    body: &mut http::StreamBody<H3Recv>,
+) {
     let limit = ctx.request_timeout.unwrap_or(Duration::from_secs(30));
+    let body_limit = ctx.request_timeout.unwrap_or(Duration::from_secs(86_400));
     loop {
-        {
+        let want_body = {
             let mut st = conn.st.borrow_mut();
+            if !st.body.done
+                && !st.rejected
+                && let Err(status) = st.body.feed(rbuf)
+            {
+                st.reject(status);
+            }
+            if !st.body.done && !st.rejected && body.ended() {
+                // Shorter than its Content-Length.
+                st.disconnected = true;
+            }
             crate::staticf::pump(&mut st);
-        }
+            !st.body.done
+                && !st.rejected
+                && !st.disconnected
+                && !body.ended()
+                && st.body.buf.len() < http::BODY_HWM
+        };
         if flush_h3(conn).await.is_err() {
             conn.st.borrow_mut().disconnected = true;
             wake_http_recv(conn);
@@ -691,7 +725,22 @@ async fn drive(ctx: &AppCtx, conn: &Conn) {
                 std::task::Poll::Pending
             }
         });
-        if tokio::time::timeout(limit, notified).await.is_err() {
+        if want_body {
+            // `--request-timeout` bounds how long the body may stall.
+            let got = tokio::select! {
+                r = poll_fn(|cx| body.poll_into(rbuf, cx)) => Some(r),
+                _ = notified => None,
+                _ = tokio::time::sleep(body_limit) => {
+                    conn.st.borrow_mut().reject(408);
+                    None
+                }
+            };
+            if let Some(Err(())) = got {
+                conn.st.borrow_mut().disconnected = true;
+                wake_http_recv(conn);
+                return;
+            }
+        } else if tokio::time::timeout(limit, notified).await.is_err() {
             conn.st.borrow_mut().disconnected = true;
             wake_http_recv(conn);
             return;
@@ -805,7 +854,7 @@ fn teardown_parent(sh: &Shared, conn: &Conn) {
     sh.conns.borrow_mut().try_remove(conn.slot as usize);
 }
 
-fn alloc_stream(sh: &Shared, peer: SocketAddr, stream: H3Stream) -> Rc<Conn> {
+fn alloc_stream(sh: &Shared, peer: SocketAddr, stream: H3Send, recv: Option<H3Recv>) -> Rc<Conn> {
     let generation = sh.next_generation();
     let mut conns = sh.conns.borrow_mut();
     let entry = conns.vacant_entry();
@@ -820,62 +869,11 @@ fn alloc_stream(sh: &Shared, peer: SocketAddr, stream: H3Stream) -> Rc<Conn> {
         remote: RefCell::new(None),
         st: RefCell::new(crate::http::State::new()),
         h2: RefCell::new(None),
-        h3: RefCell::new(Some(H3Tx::new(stream))),
+        h3: RefCell::new(Some(H3Tx::new(stream, recv))),
         waker: RefCell::new(None),
     });
     entry.insert(conn.clone());
     conn
-}
-
-fn synthesize(parts: &::http::request::Parts, body_len: usize) -> BytesMut {
-    let method = parts.method.as_str();
-    let path = parts
-        .uri
-        .path_and_query()
-        .map(|p| p.as_str())
-        .unwrap_or("/");
-    let path = if path.is_empty() { "/" } else { path };
-    let authority = parts
-        .uri
-        .authority()
-        .map(|a| a.as_str().to_string())
-        .or_else(|| {
-            parts
-                .headers
-                .get(::http::header::HOST)
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string())
-        })
-        .unwrap_or_else(|| "localhost".into());
-    let mut out = BytesMut::new();
-    out.extend_from_slice(method.as_bytes());
-    out.extend_from_slice(b" ");
-    out.extend_from_slice(path.as_bytes());
-    out.extend_from_slice(b" HTTP/1.1\r\n");
-    out.extend_from_slice(b"host: ");
-    out.extend_from_slice(authority.as_bytes());
-    out.extend_from_slice(b"\r\n");
-    let mut has_cl = false;
-    for (name, value) in &parts.headers {
-        let n = name.as_str();
-        if n == "host" || n == "transfer-encoding" {
-            continue;
-        }
-        if n == "content-length" {
-            has_cl = true;
-        }
-        out.extend_from_slice(n.as_bytes());
-        out.extend_from_slice(b": ");
-        out.extend_from_slice(value.as_bytes());
-        out.extend_from_slice(b"\r\n");
-    }
-    if !has_cl && body_len > 0 {
-        out.extend_from_slice(b"content-length: ");
-        crate::http::push_int(&mut out, body_len as u64);
-        out.extend_from_slice(b"\r\n");
-    }
-    out.extend_from_slice(b"\r\n");
-    out
 }
 
 fn hop_by_hop(name: &[u8]) -> bool {
