@@ -85,3 +85,17 @@ def test_hit_does_not_read_body_as_request():
         assert resp.count(b'HTTP/1.1 ') == 1
         assert cache_app.HITS['/private'] == 0
         assert cache_app.HITS['/fresh'] == 2
+
+
+def test_absent_accept_encoding_is_its_own_variant():
+    """A copy made for a request without Accept-Encoding is not a copy that
+    does not vary: a request that names one gets its own."""
+    cache_app.HITS.clear()
+    with serve_thread(cache_app.app, cache_size=8) as url:
+        bare = b'GET /vary HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n'
+        assert raw(url, bare).endswith(b'for:-')
+        gz = b'GET /vary HTTP/1.1\r\nhost: x\r\naccept-encoding: gzip\r\nconnection: close\r\n\r\n'
+        assert raw(url, gz).endswith(b'for:gzip')
+        assert raw(url, bare).endswith(b'for:-')
+        assert raw(url, gz).endswith(b'for:gzip')
+        assert cache_app.HITS['/vary'] == 2

@@ -321,11 +321,7 @@ pub fn dispatch(sh: &Shared, ctx: &Rc<AppCtx>, conn: &Rc<Conn>, rbuf: &mut Bytes
         let https = meta.secure.unwrap_or(ctx.https);
         let key = crate::cache::key(https, host, target, forwarded);
         let ae = crate::compress::raw_accept(req.headers);
-        let variant = if ae.is_empty() {
-            0
-        } else {
-            crate::cache::variant_hash(&ae)
-        };
+        let variant = crate::cache::variant_hash(&ae);
         (
             key,
             crate::cache::target_hash(target),

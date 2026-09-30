@@ -17,7 +17,7 @@ async def app(scope, receive, send):
         return
     path = scope['path']
     method = scope['method']
-    if method != 'GET' or path in ('/fresh', '/private', '/item', '/missing'):
+    if method != 'GET' or path in ('/fresh', '/private', '/item', '/missing', '/vary'):
         HITS[path] += 1
     if path == '/fresh':
         body = (b'fresh-%d-' % HITS[path]) + b'x' * 1200
@@ -38,6 +38,14 @@ async def app(scope, receive, send):
         headers = [(b'content-type', b'text/plain'), (b'cache-control', b'max-age=60')]
         await send({'type': 'http.response.start', 'status': 200, 'headers': headers})
         await send({'type': 'http.response.body', 'body': b'item-%d' % HITS[path]})
+        return
+    if path == '/vary':
+        # Varies on Accept-Encoding, and says which one it was made for.
+        ae = dict(scope['headers']).get(b'accept-encoding', b'-')
+        headers = [(b'content-type', b'text/plain'), (b'cache-control', b'max-age=60'),
+                   (b'vary', b'accept-encoding')]
+        await send({'type': 'http.response.start', 'status': 200, 'headers': headers})
+        await send({'type': 'http.response.body', 'body': b'for:' + ae})
         return
     if path == '/missing':
         headers = [(b'content-type', b'text/plain'), (b'cache-control', b'max-age=30')]

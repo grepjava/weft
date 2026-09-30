@@ -308,6 +308,9 @@ pub fn target_hash(target: &[u8]) -> u64 {
     fnv(target)
 }
 
+/// The `Accept-Encoding` a copy that varies on it was made for. Never 0,
+/// which is a copy that does not vary: a request without the header has a
+/// variant of its own.
 pub fn variant_hash(ae: &[u8]) -> u64 {
     fnv(ae)
 }
@@ -463,7 +466,11 @@ pub fn store(
                 continue;
             };
             let (s, pay) = g.parts();
-            let rank = if s.hash == hash && pay.get(..s.key_len as usize) == Some(key) {
+            // Another variant of the same URL is kept alongside, not replaced.
+            let rank = if s.hash == hash
+                && s.variant == variant
+                && pay.get(..s.key_len as usize) == Some(key)
+            {
                 0
             } else if s.hash == 0 || s.epoch != epoch || s.expiry_ms <= now {
                 1
@@ -1147,6 +1154,30 @@ cache-control: max-age=60
         assert!(end <= len, "layout {end} exceeds allocation {len}");
         assert_eq!(large.n, 0);
         assert!(small.n > 0);
+    }
+
+    #[test]
+    fn variants_of_one_url_are_kept_side_by_side() {
+        let _serial = table();
+        let k = key(false, b"localhost", b"/variants", None).unwrap();
+        let (bare, gz) = (variant_hash(b""), variant_hash(b"gzip"));
+        assert!(bare != 0 && gz != 0 && bare != gz);
+        for (v, body) in [(bare, &b"bare"[..]), (gz, &b"gzip"[..])] {
+            store(
+                &k,
+                target_hash(b"/variants"),
+                v,
+                200,
+                b"vary: accept-encoding
+",
+                body,
+                60,
+                0,
+            );
+        }
+        assert!(lookup(&k, 0, None).is_none());
+        assert_eq!(lookup(&k, bare, None).expect("bare").body, b"bare");
+        assert_eq!(lookup(&k, gz, None).expect("gzip").body, b"gzip");
     }
 
     #[test]
