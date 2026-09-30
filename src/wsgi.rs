@@ -208,6 +208,8 @@ pub unsafe fn environ(
             i.server_protocol,
             PyRef::borrow(if conn.st.borrow().h3 {
                 i.proto_3
+            } else if conn.st.borrow().h2 {
+                i.proto_2
             } else if http11 {
                 i.proto_1_1
             } else {
@@ -635,7 +637,8 @@ fn next_request(sh: &Shared, conn: &Conn) -> Next {
 }
 
 /// The legacy `write(data)` callable. It must have sent the bytes (or
-/// handed them to the OS) before it returns, so it waits on the socket here.
+/// handed them to the OS) before it returns, so it waits on the socket here;
+/// an HTTP/2 or HTTP/3 stream can only queue them.
 unsafe fn write(sr: &mut StartResponseObj, data: *mut PyObject) -> PResult<()> {
     unsafe {
         if PyBytes_Check(data) == 0 {
@@ -699,17 +702,22 @@ unsafe fn flush_blocking(ctx: &AppCtx, conn: &Conn) -> PResult<()> {
     let ms = ctx
         .request_timeout
         .map_or(-1, |d| d.as_millis().min(i32::MAX as u128) as i32);
+    // An HTTP/2 or HTTP/3 stream has no socket of its own: it drains when
+    // the connection's task runs, on this thread. Waiting here would wait
+    // forever, so what does not fit now stays queued for that task.
+    let multiplexed = conn.io.borrow().is_none();
     loop {
         let r = crate::http::flush_conn(conn);
         let ok = match r {
             Ok(true) => return Ok(()),
+            Ok(false) if multiplexed => return Ok(()),
             Ok(false) => unsafe {
                 let ts = PyEval_SaveThread();
                 let ok = conn
                     .io
                     .borrow()
                     .as_ref()
-                    .is_none_or(|io| crate::fdpoll::wait_writable(&io.tcp, ms));
+                    .is_some_and(|io| crate::fdpoll::wait_writable(&io.tcp, ms));
                 PyEval_RestoreThread(ts);
                 ok
             },

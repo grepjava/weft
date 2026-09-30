@@ -92,6 +92,7 @@ def test_h2_wsgi(tmp_path):
             assert r.text == 'Hello, world!'
             env = c.get(url.replace('http://', 'https://') + '/environ').json()
             assert env['wsgi.url_scheme'] == 'https'
+            assert env['SERVER_PROTOCOL'] == 'HTTP/2'
 
 
 def test_h2_multiplex(tmp_path):
@@ -248,3 +249,23 @@ def test_h2_large_static_file(tmp_path):
             assert r.content == data
             # The connection is still good for another stream.
             assert c.get(url.replace('http://', 'https://') + '/').text == 'Hello, world!'
+
+
+def _big_write(environ, start_response):
+    """Legacy write() with more than an HTTP/2 window holds."""
+    write = start_response('200 OK', [('content-type', 'application/octet-stream')])
+    write(b'w' * (1024 * 1024))
+    return [b'end']
+
+
+def test_h2_wsgi_large_write(tmp_path):
+    _openssl()
+    cert, key = _cert(tmp_path, 'localhost')
+    with serve_thread(_big_write, protocol='wsgi', request_timeout=2.0,
+                      tls_certs=[str(cert)], tls_keys=[str(key)]) as url:
+        with httpx.Client(verify=False, http2=True, timeout=10.0) as c:
+            r = c.get(url.replace('http://', 'https://') + '/')
+            assert r.http_version == 'HTTP/2'
+            assert r.content == b'w' * (1024 * 1024) + b'end'
+            # The worker is still serving.
+            assert c.get(url.replace('http://', 'https://') + '/').status_code == 200

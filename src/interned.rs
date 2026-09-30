@@ -127,6 +127,7 @@ interned! {
     wsgi_file_wrapper = c"wsgi.file_wrapper",
     proto_1_0 = c"HTTP/1.0",
     proto_1_1 = c"HTTP/1.1",
+    proto_2 = c"HTTP/2",
     proto_3 = c"HTTP/3",
     empty_str = c"",
     // method and keyword names
