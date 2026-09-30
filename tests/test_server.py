@@ -375,3 +375,26 @@ def test_supervisor_stops_started_workers_when_a_later_one_fails(monkeypatch):
     assert len(procs) == 2
     assert procs[0].stop.is_set()
     assert not procs[0].alive
+
+
+@pytest.mark.skipif(sys.platform == 'win32', reason='SIGTERM ends a Windows process at once')
+@pytest.mark.parametrize('mode', ['process', 'thread'])
+def test_sigterm_drains_and_shuts_down(tmp_path, mode):
+    import signal
+
+    mark = tmp_path / 'mark'
+    args = ('--workers', '2', '--worker-mode', mode, '--drain-delay', '0.5')
+    with serve_process('tests.apps.shutdown_app:app', *args, env={'WEFT_TEST_MARK': str(mark)}) as (url, proc):
+        result = {}
+        t = threading.Thread(target=lambda: result.update(r=httpx.get(url + '/slow', timeout=10)))
+        t.start()
+        time.sleep(0.3)
+        start = time.monotonic()
+        proc.send_signal(signal.SIGTERM)
+        t.join(10)
+        assert result['r'].status_code == 200
+        assert result['r'].text == 'done'
+        assert proc.wait(15) == 0
+        # Drained first, then every worker ran its lifespan shutdown.
+        assert time.monotonic() - start >= 0.5
+        assert len(mark.read_text().split()) == 2

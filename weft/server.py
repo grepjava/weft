@@ -4,6 +4,7 @@ processes. Process workers share the supervisor's socket; a SIGHUP or
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import multiprocessing
 import multiprocessing.connection
@@ -228,11 +229,34 @@ def _ensure_metrics_map(config: Config, n: int) -> str | None:
     return path
 
 
+@contextlib.contextmanager
+def _signals(handlers: dict):
+    """Handles the named signals while the block runs, then puts back what
+    was there. Only the main thread can; elsewhere this does nothing."""
+    previous = {}
+    if threading.current_thread() is threading.main_thread():
+        for name, fn in handlers.items():
+            sig = getattr(signal, name, None)
+            if sig is None:
+                continue
+            try:
+                previous[sig] = signal.signal(sig, lambda *_, fn=fn: fn())
+            except (OSError, ValueError):
+                pass
+    try:
+        yield
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
 def _run_threads(config: Config, sock, n: int) -> int:
     if getattr(sys, '_is_gil_enabled', lambda: True)():
         logger.warning('thread workers share one GIL on this interpreter; use processes for parallelism')
     app = config.load_app()
-    stop = threading.Event()
+    # Signals reach only this thread: SIGTERM stops the workers gracefully,
+    # after --drain-delay; Ctrl+C skips the delay, as with one worker.
+    stop, quit = threading.Event(), threading.Event()
     codes: list[int] = []
 
     def target(i):
@@ -240,20 +264,21 @@ def _run_threads(config: Config, sock, n: int) -> int:
         cfg.metrics_slot = i
         cfg.metrics_listen = i == 0
         cfg.http3_listen = i == 0 if os.name == 'nt' else True
-        codes.append(worker.run(cfg, sock, stop, app))
+        codes.append(worker.run(cfg, sock, stop, app, quit=quit))
 
-    threads = [threading.Thread(target=target, args=(i,), name=f'weft-worker-{i}') for i in range(n)]
-    for t in threads:
-        t.start()
-    try:
-        while any(t.is_alive() for t in threads):
-            time.sleep(0.2)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        stop.set()
+    with _signals({'SIGTERM': stop.set}):
+        threads = [threading.Thread(target=target, args=(i,), name=f'weft-worker-{i}') for i in range(n)]
         for t in threads:
-            t.join()
+            t.start()
+        try:
+            while any(t.is_alive() for t in threads):
+                time.sleep(0.2)
+        except KeyboardInterrupt:
+            quit.set()
+        finally:
+            stop.set()
+            for t in threads:
+                t.join()
     return max(codes, default=0)
 
 
@@ -362,79 +387,90 @@ def _run_supervisor(config: Config, sock, n: int) -> int:
             p.join(2)
         raise RuntimeError(f'worker {i} did not start serving')
 
-    slots: list[_Slot] = []
-    try:
-        for i in range(n):
-            slots.append(spawn(i))
-    except BaseException as e:
-        # The workers that did start are serving: stop them before giving up.
-        for slot in slots:
-            slot.stop.set()
-        for slot in slots:
-            slot.proc.join(config.graceful_timeout + 5)
-            if slot.proc.is_alive():
-                slot.proc.terminate()
-                slot.proc.join(2)
-        if not isinstance(e, RuntimeError):
-            raise
-        logger.error('%s', e)
-        return 3
+    terminating = False
 
-    def sighup(*_):
+    def sigterm():
+        nonlocal terminating
+        terminating = True
+
+    def sighup():
         nonlocal reload_wanted
         reload_wanted = True
 
-    if threading.current_thread() is threading.main_thread() and hasattr(signal, 'SIGHUP'):
-        signal.signal(signal.SIGHUP, sighup)
-
-    def rolling(why: str) -> None:
-        logger.info(why)
-        config.cache_flush = True
-        for i, slot in enumerate(slots):
-            try:
-                fresh = spawn(i)
-            except RuntimeError:
-                logger.error('cannot spawn a replacement for worker %d; keeping the current one', i)
-                return
-            slot.quit.set()
-            slot.proc.join(config.graceful_timeout + 5)
-            if slot.proc.is_alive():
-                slot.proc.terminate()
-                slot.proc.join(2)
-            slots[i] = fresh
-        logger.info('workers reloaded')
-
-    try:
-        while True:
-            if reload_wanted and not shutting:
-                reload_wanted = False
-                rolling('SIGHUP: reloading workers')
-            if watcher is not None and not shutting and watcher.changed():
-                rolling('source change detected; reloading workers')
-            for i, slot in enumerate(slots):
+    def serve() -> int:
+        nonlocal shutting, reload_wanted
+        slots: list[_Slot] = []
+        try:
+            for i in range(n):
+                slots.append(spawn(i))
+        except BaseException as e:
+            # The workers that did start are serving: stop them before giving up.
+            for slot in slots:
+                slot.stop.set()
+            for slot in slots:
+                slot.proc.join(config.graceful_timeout + 5)
                 if slot.proc.is_alive():
-                    continue
-                if slot.proc.exitcode == 3:
-                    logger.error('worker %d failed to start; shutting down', i)
-                    return 3
-                logger.warning('worker %d (pid %s) exited with %s; restarting', i, slot.proc.pid, slot.proc.exitcode)
+                    slot.proc.terminate()
+                    slot.proc.join(2)
+            if not isinstance(e, RuntimeError):
+                raise
+            logger.error('%s', e)
+            return 3
+
+        def rolling(why: str) -> None:
+            logger.info(why)
+            config.cache_flush = True
+            for i, slot in enumerate(slots):
                 try:
-                    slots[i] = spawn(i)
+                    fresh = spawn(i)
                 except RuntimeError:
-                    logger.error('cannot restart worker %d', i)
-                    return 3
-            time.sleep(0.15)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        shutting = True
-        for slot in slots:
-            slot.stop.set()
-        deadline = time.monotonic() + config.graceful_timeout + 5
-        for slot in slots:
-            slot.proc.join(max(0.0, deadline - time.monotonic()))
-        for slot in slots:
-            if slot.proc.is_alive():
-                slot.proc.terminate()
-                slot.proc.join(2)
-    return 0
+                    logger.error('cannot spawn a replacement for worker %d; keeping the current one', i)
+                    return
+                slot.quit.set()
+                slot.proc.join(config.graceful_timeout + 5)
+                if slot.proc.is_alive():
+                    slot.proc.terminate()
+                    slot.proc.join(2)
+                slots[i] = fresh
+            logger.info('workers reloaded')
+
+        try:
+            while not terminating:
+                if reload_wanted and not shutting:
+                    reload_wanted = False
+                    rolling('SIGHUP: reloading workers')
+                if watcher is not None and not shutting and watcher.changed():
+                    rolling('source change detected; reloading workers')
+                for i, slot in enumerate(slots):
+                    if slot.proc.is_alive():
+                        continue
+                    if slot.proc.exitcode == 3:
+                        logger.error('worker %d failed to start; shutting down', i)
+                        return 3
+                    logger.warning('worker %d (pid %s) exited with %s; restarting', i, slot.proc.pid, slot.proc.exitcode)
+                    try:
+                        slots[i] = spawn(i)
+                    except RuntimeError:
+                        logger.error('cannot restart worker %d', i)
+                        return 3
+                time.sleep(0.15)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            shutting = True
+            for slot in slots:
+                slot.stop.set()
+            deadline = time.monotonic() + config.drain_delay + config.graceful_timeout + 5
+            for slot in slots:
+                slot.proc.join(max(0.0, deadline - time.monotonic()))
+            for slot in slots:
+                if slot.proc.is_alive():
+                    slot.proc.terminate()
+                    slot.proc.join(2)
+        return 0
+
+    # SIGTERM stops the workers the way they stop themselves: gracefully,
+    # after --drain-delay. Without it the supervisor would die at once and
+    # its workers, orphaned, would skip the delay.
+    with _signals({'SIGTERM': sigterm, 'SIGHUP': sighup}):
+        return serve()
