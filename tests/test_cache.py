@@ -67,3 +67,21 @@ def test_compressed_from_one_copy():
         assert b'cache-status: weft; hit' in head
         assert b'content-encoding: gzip' in head
         assert cache_app.HITS['/fresh'] == 1
+
+
+def test_hit_does_not_read_body_as_request():
+    """A GET that frames a body goes to the application: answered from the
+    cache, its body would be read as a second request."""
+    from urllib.parse import urlparse
+
+    cache_app.HITS.clear()
+    with serve_thread(cache_app.app, cache_size=8) as url:
+        httpx.get(url + '/fresh')
+        u = urlparse(url)
+        host = f'{u.hostname}:{u.port}'.encode()
+        inner = b'GET /private HTTP/1.1\r\nhost: ' + host + b'\r\n\r\n'
+        outer = b'GET /fresh HTTP/1.1\r\nhost: ' + host + b'\r\ncontent-length: %d\r\n\r\n' % len(inner)
+        resp = raw(url, outer + inner, timeout=1.0)
+        assert resp.count(b'HTTP/1.1 ') == 1
+        assert cache_app.HITS['/private'] == 0
+        assert cache_app.HITS['/fresh'] == 2

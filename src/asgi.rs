@@ -332,7 +332,11 @@ pub fn dispatch(sh: &Shared, ctx: &Rc<AppCtx>, conn: &Rc<Conn>, rbuf: &mut Bytes
             crate::cache::request_ok(method, req.headers),
         )
     });
+    // A hit answers from the head alone, so a request that frames a body is
+    // left to the application: its body must not be read as the next request.
     if let Some((Some(key), _, variant, true)) = cache_prep.as_ref()
+        && !chunked
+        && length.unwrap_or(0) == 0
         && let Some(mut hit) =
             crate::cache::lookup(key, 0, None).or_else(|| crate::cache::lookup(key, *variant, None))
     {
