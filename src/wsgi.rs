@@ -593,6 +593,9 @@ unsafe fn take_head(
         push_int(&mut p.head, n);
         p.head.extend_from_slice(b"\r\n");
         p.info.length = Some(n);
+        if let Some(seen) = p.info.seen.as_mut() {
+            seen.content_length = true;
+        }
     }
     sr.sent = true;
     Ok(Some(p))

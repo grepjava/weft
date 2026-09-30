@@ -56,6 +56,8 @@ def test_hello(wsgi):
     assert r.headers['content-length'] == '13'
     assert r.headers['server'] == 'weft'
     assert 'date' in r.headers
+    out = raw(wsgi, b'GET / HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n')
+    assert out.lower().count(b'content-length:') == 1
 
 
 def test_environ(wsgi, request):
