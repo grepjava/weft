@@ -917,14 +917,19 @@ async fn respond(sh: &Shared, ctx: &AppCtx, conn: &Conn, sr: &PyRef, r: &PyRef) 
                 total += PyBytes_Size(b) as u64;
             }
             tryp!(commit(&mut *srp, conn, Some(total)));
+            // The last block ends the response itself, head and all when it
+            // is the only one: `[body]` is the common case.
             for k in 0..n {
                 let b = PyRef::borrow(item(k));
-                if !tryp!(queue(sh, ctx, conn, b.ptr(), true)) {
+                if !tryp!(queue(sh, ctx, conn, b.ptr(), k + 1 < n)) {
                     return Next::Close;
                 }
                 if conn.st.borrow().out.len() >= http::WRITE_HWM && !flush_all(ctx, conn).await {
                     return Next::Close;
                 }
+            }
+            if n == 0 && !tryp!(queue(sh, ctx, conn, empty_bytes(), false)) {
+                return Next::Close;
             }
         } else {
             let it = tryp!(PyRef::own(PyObject_GetIter(obj)));
@@ -965,9 +970,9 @@ async fn respond(sh: &Shared, ctx: &AppCtx, conn: &Conn, sr: &PyRef, r: &PyRef) 
                 }
                 block = tryp!(next());
             }
-        }
-        if !tryp!(queue(sh, ctx, conn, empty_bytes(), false)) {
-            return Next::Close;
+            if !tryp!(queue(sh, ctx, conn, empty_bytes(), false)) {
+                return Next::Close;
+            }
         }
     }
     let next = next_request(sh, conn);
