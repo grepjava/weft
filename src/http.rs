@@ -202,6 +202,9 @@ pub struct State {
     /// The server answered this request itself, part way through its body;
     /// what the application still sends goes nowhere.
     pub rejected: bool,
+    /// A static file ended short of the Content-Length already sent: the
+    /// response is cut off, never ended cleanly.
+    pub aborted: bool,
     /// Set by a WebSocket handshake, for the rest of the connection.
     pub ws: Option<Box<crate::ws::Ws>>,
     /// A WebTransport session on this HTTP/3 CONNECT stream.
@@ -245,6 +248,7 @@ impl State {
             drain_waiters: Vec::new(),
             disconnected: false,
             rejected: false,
+            aborted: false,
             ws: None,
             wt: None,
             request_id: Vec::new(),
@@ -283,6 +287,7 @@ impl State {
         self.body.buf.clear();
         self.final_delivered = false;
         self.rejected = false;
+        self.aborted = false;
         self.resp = Resp::default();
         self.request_id.clear();
         self.log = None;
@@ -610,21 +615,28 @@ pub async fn flush_all(ctx: &AppCtx, conn: &Conn) -> bool {
                 return false;
             }
             let more_file = crate::staticf::pump(&mut st);
+            if st.aborted {
+                drop(st);
+                abort(conn);
+                return false;
+            }
             if conn.h3.borrow().is_some() {
                 drop(st);
-                return match crate::h3c::flush_h3(conn).await {
-                    Ok(_) => true,
-                    Err(_) => {
-                        conn.st.borrow_mut().disconnected = true;
-                        false
-                    }
-                };
+                if crate::h3c::flush_h3(conn).await.is_err() {
+                    conn.st.borrow_mut().disconnected = true;
+                    return false;
+                }
+                // A file goes out 64 KiB at a time: pump the next piece.
+                if conn.st.borrow().send_file.is_none() {
+                    return true;
+                }
+                continue;
             }
             if conn.h2.borrow().is_some() {
                 drop(st);
                 loop {
                     match flush_conn(conn) {
-                        Ok(true) => return true,
+                        Ok(true) => break,
                         Ok(false) => {
                             let wait = poll_fn(|cx| match conn.h2.borrow_mut().as_mut() {
                                 Some(tx) => tx.poll_capacity(cx),
@@ -644,6 +656,10 @@ pub async fn flush_all(ctx: &AppCtx, conn: &Conn) -> bool {
                         }
                     }
                 }
+                if conn.st.borrow().send_file.is_none() {
+                    return true;
+                }
+                continue;
             }
             match flush(&conn.io(), &mut st.out) {
                 Ok(true)
@@ -669,6 +685,24 @@ pub async fn flush_all(ctx: &AppCtx, conn: &Conn) -> bool {
             st.out.clear();
             return false;
         }
+    }
+}
+
+/// Cuts off a response that cannot be completed: an HTTP/2 or HTTP/3 stream
+/// is reset, and an HTTP/1.1 connection is closed without what is queued,
+/// so that no client takes a short body for a whole one.
+pub(crate) fn abort(conn: &Conn) {
+    {
+        let mut st = conn.st.borrow_mut();
+        st.disconnected = true;
+        st.out.clear();
+        st.send_file = None;
+    }
+    if let Some(tx) = conn.h2.borrow_mut().as_mut() {
+        tx.reset();
+    }
+    if let Some(tx) = conn.h3.borrow_mut().as_mut() {
+        tx.reset();
     }
 }
 

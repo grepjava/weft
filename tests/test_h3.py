@@ -34,9 +34,11 @@ class Client(QuicConnectionProtocol):
                 slot = self._done.setdefault(ev.stream_id, {'status': None, 'headers': {}, 'body': b''})
                 slot['status'] = status
                 slot['headers'] = headers
+                slot['ended'] = ev.stream_ended
             elif isinstance(ev, DataReceived):
                 self._done.setdefault(ev.stream_id, {'status': None, 'headers': {}, 'body': b''})
                 self._done[ev.stream_id]['body'] += ev.data
+                self._done[ev.stream_id]['ended'] = ev.stream_ended
 
     async def request(self, method, path, headers=None, body=b''):
         stream_id = self._quic.get_next_available_stream_id()
@@ -204,3 +206,37 @@ def test_http3_dispatches_before_body_ends(tmp_path):
     with serve_thread(_first_chunk, lifespan='off', tls_certs=[str(cert)], tls_keys=[str(key)], http3=True) as url:
         port = int(url.rsplit(':', 1)[1])
         assert run(open_post(port)) == (200, b'hello+')
+
+
+def test_http3_large_static_file(tmp_path):
+    import os
+
+    from tests.apps.basic import app
+
+    root = tmp_path / 'www'
+    root.mkdir()
+    data = os.urandom(1024 * 1024)
+    (root / 'big.bin').write_bytes(data)
+
+    async def fetch(port):
+        async with connect('127.0.0.1', port, configuration=configuration(), create_protocol=Client) as client:
+            stream_id = client._quic.get_next_available_stream_id()
+            client._http.send_headers(stream_id, [
+                (b':method', b'GET'), (b':scheme', b'https'),
+                (b':authority', b'localhost'), (b':path', b'/static/big.bin'),
+            ], end_stream=True)
+            client.transmit()
+            for _ in range(2000):
+                d = client._done.get(stream_id)
+                if d and d.get('ended'):
+                    return d['status'], d['body']
+                await asyncio.sleep(0.01)
+            raise TimeoutError('the response never ended')
+
+    cert, key = _cert(tmp_path, 'localhost')
+    with serve_thread(app, tls_certs=[str(cert)], tls_keys=[str(key)], http3=True, static_dirs=[f'/static={root}']) as url:
+        port = int(url.rsplit(':', 1)[1])
+        status, body = run(fetch(port))
+        assert status == 200
+        assert len(body) == len(data)
+        assert body == data

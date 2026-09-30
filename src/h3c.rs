@@ -55,6 +55,17 @@ impl H3Tx {
     }
 }
 
+impl H3Tx {
+    pub fn reset(&mut self) {
+        if let Some(s) = self.stream.as_mut()
+            && !self.finished
+        {
+            s.stop_stream(h3::error::Code::H3_INTERNAL_ERROR);
+        }
+        self.finished = true;
+    }
+}
+
 impl http::BodySource for H3Recv {
     fn poll_piece(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<Bytes>, ()>> {
         match self.poll_recv_data(cx) {
@@ -692,6 +703,12 @@ async fn drive(
                 st.disconnected = true;
             }
             crate::staticf::pump(&mut st);
+            if st.aborted {
+                drop(st);
+                http::abort(conn);
+                wake_http_recv(conn);
+                return;
+            }
             !st.body.done
                 && !st.rejected
                 && !st.disconnected

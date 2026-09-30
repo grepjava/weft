@@ -227,3 +227,24 @@ def test_h2c_body_in_pieces():
                     break
                 sock.sendall(conn.data_to_send())
         assert body == b'abcdef'
+
+
+def test_h2_large_static_file(tmp_path):
+    import os
+
+    from tests.apps.basic import app
+
+    _openssl()
+    cert, key = _cert(tmp_path, 'localhost')
+    root = tmp_path / 'www'
+    root.mkdir()
+    data = os.urandom(1024 * 1024)
+    (root / 'big.bin').write_bytes(data)
+    with serve_thread(app, tls_certs=[str(cert)], tls_keys=[str(key)], static_dirs=[f'/static={root}']) as url:
+        with httpx.Client(verify=False, http2=True, timeout=10.0) as c:
+            r = c.get(url.replace('http://', 'https://') + '/static/big.bin')
+            assert r.http_version == 'HTTP/2'
+            assert r.status_code == 200
+            assert r.content == data
+            # The connection is still good for another stream.
+            assert c.get(url.replace('http://', 'https://') + '/').text == 'Hello, world!'

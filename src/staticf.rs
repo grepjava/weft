@@ -68,23 +68,28 @@ pub fn open(
     let mut coding = Coding::Identity;
     let mut send = file;
     let mut send_size = size;
+    let mut send_mtime = mtime_ns;
     if compress_static {
         for c in compress::ranked(headers) {
             let mut name = rel.to_string();
             name.push_str(std::str::from_utf8(c.suffix()).unwrap_or(""));
-            if let Some((f, sz, _)) = open_under(&route.root, &name) {
+            if let Some((f, sz, mt)) = open_under(&route.root, &name) {
                 coding = c;
                 send = f;
                 send_size = sz;
+                send_mtime = mt;
                 break;
             }
         }
     }
-    let mut etag = format!("\"{mtime_ns:x}-{size:x}\"");
-    if coding != Coding::Identity {
-        etag.push('-');
-        etag.push_str(std::str::from_utf8(coding.file_token()).unwrap());
-    }
+    // The validator is the bytes actually sent: a precompressed copy has its
+    // own, and its coding stays inside the quotes.
+    let etag = if coding == Coding::Identity {
+        format!("\"{send_mtime:x}-{send_size:x}\"")
+    } else {
+        let token = std::str::from_utf8(coding.file_token()).unwrap_or("");
+        format!("\"{send_mtime:x}-{send_size:x}-{token}\"")
+    };
     Some(Opened {
         file: send,
         size: send_size,
@@ -122,6 +127,7 @@ impl Opened {
 }
 
 /// Writes the response. A large file is left on `st` for `flush_all` to pump.
+/// `false` when the file could not be read whole and a 500 went out instead.
 #[allow(clippy::too_many_arguments)]
 pub fn write(
     st: &mut State,
@@ -132,7 +138,24 @@ pub fn write(
     server: bool,
     hsts: Option<&[u8]>,
     stopping: bool,
-) {
+) -> bool {
+    let mut file = opened.file;
+    let body = st.resp.status == 200 && !head_only && opened.size > 0;
+    // A small file is read before the head goes out, so a file that shrank
+    // since it was opened is an error rather than a short body.
+    let inline = if body && opened.size <= INLINE {
+        let mut buf = Vec::with_capacity(opened.size as usize);
+        match (&mut file).take(opened.size).read_to_end(&mut buf) {
+            Ok(n) if n as u64 == opened.size => Some(buf),
+            _ => {
+                st.keep_alive = false;
+                st.write_error(500);
+                return false;
+            }
+        }
+    } else {
+        None
+    };
     let keep = keep && !stopping;
     st.keep_alive = keep;
     st.resp.close = !keep;
@@ -177,23 +200,20 @@ pub fn write(
         st.out.extend_from_slice(&st.request_id);
     }
     st.out.extend_from_slice(b"\r\n\r\n");
-    if st.resp.status != 200 || head_only || opened.size == 0 {
-        return;
+    if let Some(buf) = inline {
+        st.out.extend_from_slice(&buf);
+    } else if body {
+        st.send_file = Some(Box::new(SendFile {
+            file,
+            remaining: opened.size,
+        }));
     }
-    let mut file = opened.file;
-    if opened.size <= INLINE {
-        let mut buf = vec![0u8; opened.size as usize];
-        let n = file.read(&mut buf).unwrap_or(0);
-        st.out.extend_from_slice(&buf[..n]);
-        return;
-    }
-    st.send_file = Some(Box::new(SendFile {
-        file,
-        remaining: opened.size,
-    }));
+    true
 }
 
-/// Fills `st.out` from a pending file. `true` while more remains.
+/// Fills `st.out` from a pending file. `true` while more remains. A file
+/// that ends early or fails to read leaves `st.aborted`: its Content-Length
+/// is already out, so the response can only be cut off.
 pub fn pump(st: &mut State) -> bool {
     let Some(f) = st.send_file.as_mut() else {
         return false;
@@ -202,11 +222,17 @@ pub fn pump(st: &mut State) -> bool {
         return true;
     }
     let mut buf = [0u8; 65_536];
-    let n = f.file.read(&mut buf).unwrap_or(0);
-    if n == 0 {
-        st.send_file = None;
-        return false;
-    }
+    let n = loop {
+        match f.file.read(&mut buf) {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Ok(n) if n > 0 => break n,
+            _ => {
+                st.send_file = None;
+                st.aborted = true;
+                return false;
+            }
+        }
+    };
     let n = n.min(f.remaining as usize);
     st.out.extend_from_slice(&buf[..n]);
     f.remaining -= n as u64;
@@ -402,6 +428,121 @@ mod tests {
         assert!(
             open_under(&root, "Cargo.toml").is_some() || open_under(&root, "README.md").is_some()
         );
+    }
+
+    /// A file of `len` bytes, opened as if it were `claimed` bytes long:
+    /// what a file that shrank after it was opened looks like.
+    fn shrunk(name: &str, len: usize, claimed: u64) -> Opened {
+        let path = std::env::temp_dir().join(format!("weft-{}-{name}", std::process::id()));
+        fs::write(&path, vec![b'x'; len]).unwrap();
+        let file = File::open(&path).unwrap();
+        let _ = fs::remove_file(&path);
+        Opened {
+            file,
+            size: claimed,
+            ctype: b"application/octet-stream",
+            etag: "\"0-0\"".into(),
+            coding: Coding::Identity,
+            vary: false,
+        }
+    }
+
+    fn ok_state() -> State {
+        let mut st = State::new();
+        st.resp.status = 200;
+        st
+    }
+
+    #[test]
+    fn small_file_read_short_is_an_error() {
+        let mut st = ok_state();
+        let served = write(
+            &mut st,
+            shrunk("small", 50, 100),
+            false,
+            true,
+            &[b'x'; 29],
+            false,
+            None,
+            false,
+        );
+        assert!(!served);
+        assert!(
+            st.out.starts_with(b"HTTP/1.1 500 "),
+            "{:?}",
+            String::from_utf8_lossy(&st.out)
+        );
+        assert!(st.resp.close);
+    }
+
+    #[test]
+    fn small_file_read_whole() {
+        let mut st = ok_state();
+        assert!(write(
+            &mut st,
+            shrunk("whole", 100, 100),
+            false,
+            true,
+            &[b'x'; 29],
+            false,
+            None,
+            false
+        ));
+        assert!(st.out.ends_with(&[b'x'; 100]));
+        assert!(!st.aborted);
+    }
+
+    #[test]
+    fn large_file_cut_short_aborts() {
+        let mut st = ok_state();
+        let len = 200 * 1024;
+        assert!(write(
+            &mut st,
+            shrunk("large", len, 300 * 1024),
+            false,
+            true,
+            &[b'x'; 29],
+            false,
+            None,
+            false
+        ));
+        let head = st.out.len();
+        st.out.clear();
+        let mut sent = 0;
+        while pump(&mut st) {
+            sent += st.out.len();
+            st.out.clear();
+        }
+        sent += st.out.len();
+        assert!(head > 0);
+        assert_eq!(sent, len);
+        assert!(st.aborted);
+        assert!(st.send_file.is_none());
+    }
+
+    #[test]
+    fn large_file_sent_whole() {
+        let mut st = ok_state();
+        let len = 200 * 1024;
+        assert!(write(
+            &mut st,
+            shrunk("large-whole", len, len as u64),
+            false,
+            true,
+            &[b'x'; 29],
+            false,
+            None,
+            false
+        ));
+        st.out.clear();
+        let mut sent = 0;
+        while pump(&mut st) {
+            sent += st.out.len();
+            st.out.clear();
+        }
+        sent += st.out.len();
+        assert_eq!(sent, len);
+        assert!(!st.aborted);
     }
 
     #[test]

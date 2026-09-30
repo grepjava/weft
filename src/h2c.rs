@@ -87,6 +87,14 @@ impl H2Tx {
 }
 
 impl H2Tx {
+    pub fn reset(&mut self) {
+        if let Some(mut r) = self.respond.take() {
+            r.send_reset(h2::Reason::INTERNAL_ERROR);
+        } else if let Some(mut s) = self.send.take() {
+            s.send_reset(h2::Reason::INTERNAL_ERROR);
+        }
+    }
+
     fn send_head(&mut self, head: &[u8], eos: bool) -> io::Result<bool> {
         let Some(respond) = self.respond.as_mut() else {
             return Ok(true);

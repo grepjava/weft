@@ -269,7 +269,7 @@ pub fn dispatch(sh: &Shared, ctx: &Rc<AppCtx>, conn: &Rc<Conn>, rbuf: &mut Bytes
         st.request_id = rid;
         st.log = log;
         st.resp.status = status;
-        crate::staticf::write(
+        if crate::staticf::write(
             &mut st,
             opened,
             head_only,
@@ -278,8 +278,9 @@ pub fn dispatch(sh: &Shared, ctx: &Rc<AppCtx>, conn: &Rc<Conn>, rbuf: &mut Bytes
             ctx.server_header,
             ctx.hsts.as_deref(),
             sh.closing(),
-        );
-        st.log_response(status);
+        ) {
+            st.log_response(status);
+        }
         return Parsed::Answered(keep && !st.resp.close);
     }
     let cache_prep = ctx.cache.map(|_| {
