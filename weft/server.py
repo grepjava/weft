@@ -301,6 +301,18 @@ def _process_main(config: Config, sock, stop, quit, ready, index: int) -> None:
     sys.exit(code)
 
 
+def _reap(proc) -> None:
+    """Ends a worker that outlived its graceful stop. SIGTERM is only a
+    request (workers handle it), so one that ignores it is killed."""
+    if not proc.is_alive():
+        return
+    proc.terminate()
+    proc.join(2)
+    if proc.is_alive():
+        proc.kill()
+        proc.join(5)
+
+
 class _Slot:
     __slots__ = ('proc', 'stop', 'quit')
 
@@ -382,9 +394,7 @@ def _run_supervisor(config: Config, sock, n: int) -> int:
                 raise RuntimeError(f'worker {i} exited with {p.exitcode} before it started serving')
         quit.set()
         p.join(5)
-        if p.is_alive():
-            p.terminate()
-            p.join(2)
+        _reap(p)
         raise RuntimeError(f'worker {i} did not start serving')
 
     terminating = False
@@ -409,9 +419,7 @@ def _run_supervisor(config: Config, sock, n: int) -> int:
                 slot.stop.set()
             for slot in slots:
                 slot.proc.join(config.graceful_timeout + 5)
-                if slot.proc.is_alive():
-                    slot.proc.terminate()
-                    slot.proc.join(2)
+                _reap(slot.proc)
             if not isinstance(e, RuntimeError):
                 raise
             logger.error('%s', e)
@@ -428,9 +436,7 @@ def _run_supervisor(config: Config, sock, n: int) -> int:
                     return
                 slot.quit.set()
                 slot.proc.join(config.graceful_timeout + 5)
-                if slot.proc.is_alive():
-                    slot.proc.terminate()
-                    slot.proc.join(2)
+                _reap(slot.proc)
                 slots[i] = fresh
             logger.info('workers reloaded')
 
@@ -464,9 +470,7 @@ def _run_supervisor(config: Config, sock, n: int) -> int:
             for slot in slots:
                 slot.proc.join(max(0.0, deadline - time.monotonic()))
             for slot in slots:
-                if slot.proc.is_alive():
-                    slot.proc.terminate()
-                    slot.proc.join(2)
+                _reap(slot.proc)
         return 0
 
     # SIGTERM stops the workers the way they stop themselves: gracefully,

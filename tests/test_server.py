@@ -377,6 +377,32 @@ def test_supervisor_stops_started_workers_when_a_later_one_fails(monkeypatch):
     assert not procs[0].alive
 
 
+def test_reap_kills_a_worker_that_ignores_sigterm():
+    from weft.server import _reap
+
+    class Stubborn:
+        alive = True
+        calls = []
+
+        def is_alive(self):
+            return self.alive
+
+        def join(self, timeout=None):
+            self.calls.append('join')
+
+        def terminate(self):
+            self.calls.append('terminate')
+
+        def kill(self):
+            self.calls.append('kill')
+            self.alive = False
+
+    p = Stubborn()
+    _reap(p)
+    assert p.calls == ['terminate', 'join', 'kill', 'join']
+    assert not p.alive
+
+
 @pytest.mark.skipif(sys.platform == 'win32', reason='SIGTERM ends a Windows process at once')
 @pytest.mark.parametrize('mode', ['process', 'thread'])
 def test_sigterm_drains_and_shuts_down(tmp_path, mode):
