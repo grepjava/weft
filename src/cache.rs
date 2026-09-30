@@ -6,6 +6,7 @@
 //! query. Bodies are stored uncompressed and compressed per client on the
 //! way out.
 
+use std::cell::UnsafeCell;
 use std::fs::OpenOptions;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -45,10 +46,22 @@ struct Class {
     payload: usize,
 }
 
+/// A slot's header. Every worker touches `lock` and `seq` at once; `data`
+/// and the payload after it only through a `SlotGuard`.
 #[repr(C)]
 struct Slot {
+    /// 0 when free; otherwise when it was taken, in Unix milliseconds. A
+    /// worker that dies holding a slot leaves that time behind, and once it
+    /// is `STALE_MS` old the next worker takes the slot over.
     lock: AtomicU64,
+    /// Odd while a write is in progress: a slot taken over from a dead
+    /// writer is emptied rather than read half written.
     seq: AtomicU64,
+    data: UnsafeCell<SlotData>,
+}
+
+#[repr(C)]
+struct SlotData {
     hash: u64,
     target: u64,
     epoch: u64,
@@ -61,30 +74,78 @@ struct Slot {
     variant: u64,
 }
 
+/// Attempts at a busy slot before it is treated as unavailable. A holder
+/// copies at most one object, so this is only reached when one is stuck.
+const LOCK_TRIES: u32 = 4096;
+/// A slot held this long belongs to a worker that died holding it.
+const STALE_MS: u64 = 2000;
+
 struct SlotGuard {
-    lock: *const AtomicU64,
+    slot: &'static Slot,
+    token: u64,
+    payload: *mut u8,
+    len: usize,
+}
+
+impl SlotGuard {
+    /// Locks slot `i`, or `None` when it stays busy. `now` is the caller's
+    /// clock, in Unix milliseconds.
+    fn lock(t: &'static Table, c: Class, i: usize, now: u64) -> Option<SlotGuard> {
+        let slot = unsafe { &*slot_at(t, c, i) };
+        let token = now.max(1);
+        for n in 0..LOCK_TRIES {
+            let cur = slot.lock.load(Ordering::Relaxed);
+            let stale = cur != 0 && token.saturating_sub(cur) > STALE_MS;
+            if (cur == 0 || stale)
+                && slot
+                    .lock
+                    .compare_exchange_weak(cur, token, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+            {
+                let mut g = SlotGuard {
+                    slot,
+                    token,
+                    payload: unsafe { t.base.add(c.off + i * c.slot + META) },
+                    len: c.payload,
+                };
+                if stale && slot.seq.load(Ordering::Relaxed) & 1 == 1 {
+                    g.data().hash = 0;
+                    slot.seq.fetch_add(1, Ordering::Relaxed);
+                }
+                return Some(g);
+            }
+            if n & 63 == 63 {
+                std::thread::yield_now();
+            } else {
+                std::hint::spin_loop();
+            }
+        }
+        None
+    }
+
+    fn data(&mut self) -> &mut SlotData {
+        unsafe { &mut *self.slot.data.get() }
+    }
+
+    fn parts(&mut self) -> (&mut SlotData, &mut [u8]) {
+        unsafe {
+            (
+                &mut *self.slot.data.get(),
+                std::slice::from_raw_parts_mut(self.payload, self.len),
+            )
+        }
+    }
 }
 
 impl Drop for SlotGuard {
     fn drop(&mut self) {
-        unsafe { (*self.lock).store(0, Ordering::Release) };
+        // Only if it is still ours: a slot taken over is released by the
+        // worker that took it.
+        let _ =
+            self.slot
+                .lock
+                .compare_exchange(self.token, 0, Ordering::Release, Ordering::Relaxed);
     }
-}
-
-fn lock_slot(lock: &AtomicU64) -> SlotGuard {
-    let mut spins = 0u32;
-    while lock
-        .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
-        spins = spins.saturating_add(1);
-        if spins & 63 == 0 {
-            std::thread::yield_now();
-        } else {
-            std::hint::spin_loop();
-        }
-    }
-    SlotGuard { lock }
 }
 
 const _: () = assert!(std::mem::size_of::<Slot>() <= META);
@@ -109,8 +170,9 @@ pub fn install(bytes: usize, max_object: usize, map: Option<&str>) -> std::io::R
             (Some(m), p, bytes)
         }
         None => {
-            let mut v = vec![0u8; bytes];
-            let p = v.as_mut_ptr();
+            // Words, not bytes: the header and every slot start with atomics.
+            let mut v = vec![0u64; bytes.div_ceil(8)];
+            let p = v.as_mut_ptr() as *mut u8;
             std::mem::forget(v);
             (None, p, bytes)
         }
@@ -129,7 +191,8 @@ pub fn install(bytes: usize, max_object: usize, map: Option<&str>) -> std::io::R
 
 fn layout(len: usize, max_object: usize) -> (Class, Class) {
     let hdr = 64usize;
-    let large_payload = MAX_KEY + MAX_HEAD + max_object.max(1024);
+    // Slots stay 8-byte aligned whatever `max_object` is.
+    let large_payload = (MAX_KEY + MAX_HEAD + max_object.max(1024)).next_multiple_of(8);
     let small_payload = MAX_KEY + MAX_HEAD + 8 * 1024;
     let large_slot = META + large_payload;
     let small_slot = META + small_payload;
@@ -193,13 +256,8 @@ fn classes() -> Option<(&'static Table, [Class; 2])> {
     Some((t, [t.small, t.large]))
 }
 
-fn slot_at(t: &Table, c: Class, i: usize) -> *mut Slot {
-    unsafe { t.base.add(c.off + i * c.slot) as *mut Slot }
-}
-
-#[allow(clippy::mut_from_ref)]
-fn payload(t: &Table, c: Class, i: usize) -> &mut [u8] {
-    unsafe { std::slice::from_raw_parts_mut(t.base.add(c.off + i * c.slot + META), c.payload) }
+fn slot_at(t: &Table, c: Class, i: usize) -> *const Slot {
+    unsafe { t.base.add(c.off + i * c.slot) as *const Slot }
 }
 
 pub fn target_hash(target: &[u8]) -> u64 {
@@ -263,7 +321,8 @@ pub struct Hit {
 pub fn lookup(key: &[u8], variant: u64, now: Option<u64>) -> Option<Hit> {
     let (t, classes) = classes()?;
     let hash = fnv(key);
-    let now = now.unwrap_or_else(now_ms);
+    let clock = now_ms();
+    let now = now.unwrap_or(clock);
     let epoch = generation();
     for c in classes {
         if c.n == 0 {
@@ -272,7 +331,11 @@ pub fn lookup(key: &[u8], variant: u64, now: Option<u64>) -> Option<Hit> {
         let start = (hash as usize) % c.n;
         for p in 0..8 {
             let i = (start + p) % c.n;
-            if let Some(hit) = read_slot(t, c, i, key, hash, variant, now, epoch) {
+            // A slot that stays busy is a miss, not a wait.
+            let Some(mut g) = SlotGuard::lock(t, c, i, clock) else {
+                continue;
+            };
+            if let Some(hit) = read_slot(&mut g, key, hash, variant, now, epoch) {
                 return Some(hit);
             }
         }
@@ -280,42 +343,33 @@ pub fn lookup(key: &[u8], variant: u64, now: Option<u64>) -> Option<Hit> {
     None
 }
 
-#[allow(clippy::too_many_arguments)]
 fn read_slot(
-    t: &Table,
-    c: Class,
-    i: usize,
+    g: &mut SlotGuard,
     key: &[u8],
     hash: u64,
     variant: u64,
     now: u64,
     epoch: u64,
 ) -> Option<Hit> {
-    let s = unsafe { &*slot_at(t, c, i) };
-    let _g = lock_slot(&s.lock);
+    let (s, pay) = g.parts();
     if s.hash != hash || s.epoch != epoch || s.expiry_ms <= now || s.variant != variant {
         return None;
     }
     let (kl, hl, bl) = (s.key_len as usize, s.head_len as usize, s.body_len as usize);
-    if kl + hl + bl > c.payload {
-        return None;
-    }
-    let pay = payload(t, c, i);
-    if &pay[..kl] != key {
+    if kl + hl + bl > pay.len() || &pay[..kl] != key {
         return None;
     }
     let raw = &pay[kl..kl + hl];
     let body = pay[kl + hl..kl + hl + bl].to_vec();
-    let stored = s.stored_ms;
-    let age0 = s.age_sec;
-    let expiry = s.expiry_ms;
     let status = status_of(raw);
     let head = match raw.iter().position(|&c| c == b'\n') {
         Some(i) => raw[i + 1..].to_vec(),
         None => raw.to_vec(),
     };
-    let age = age0.saturating_add(((now.saturating_sub(stored)) / 1000) as u32);
-    let ttl = ((expiry.saturating_sub(now)) / 1000) as u32;
+    let age = s
+        .age_sec
+        .saturating_add(((now.saturating_sub(s.stored_ms)) / 1000) as u32);
+    let ttl = ((s.expiry_ms.saturating_sub(now)) / 1000) as u32;
     Some(Hit {
         status,
         head,
@@ -356,45 +410,45 @@ pub fn store(
             continue;
         }
         let start = (hash as usize) % c.n;
-        let mut best = start;
+        let mut best = None;
         let mut best_rank = 4u8;
         for p in 0..8 {
             let i = (start + p) % c.n;
-            let s = unsafe { &*slot_at(t, c, i) };
-            let _g = lock_slot(&s.lock);
-            let rank = if s.hash == hash && payload_key(t, c, i, s.key_len as usize) == key {
+            // A busy slot is passed over.
+            let Some(mut g) = SlotGuard::lock(t, c, i, now) else {
+                continue;
+            };
+            let (s, pay) = g.parts();
+            let rank = if s.hash == hash && pay.get(..s.key_len as usize) == Some(key) {
                 0
             } else if s.hash == 0 || s.epoch != epoch || s.expiry_ms <= now {
                 1
             } else {
                 2
             };
-            drop(_g);
+            drop(g);
             if rank < best_rank {
                 best_rank = rank;
-                best = i;
+                best = Some(i);
                 if rank == 0 {
                     break;
                 }
             }
         }
-        write_slot(
-            t, c, best, hash, target, epoch, expiry, now, age_sec, variant, key, status, head, body,
-        );
+        if let Some(i) = best
+            && let Some(mut g) = SlotGuard::lock(t, c, i, now)
+        {
+            write_slot(
+                &mut g, hash, target, epoch, expiry, now, age_sec, variant, key, status, head, body,
+            );
+        }
         return;
     }
 }
 
-fn payload_key(t: &Table, c: Class, i: usize, n: usize) -> &[u8] {
-    let p = payload(t, c, i);
-    &p[..n.min(p.len())]
-}
-
 #[allow(clippy::too_many_arguments)]
 fn write_slot(
-    t: &Table,
-    c: Class,
-    i: usize,
+    g: &mut SlotGuard,
     hash: u64,
     target: u64,
     epoch: u64,
@@ -407,9 +461,10 @@ fn write_slot(
     head: &[u8],
     body: &[u8],
 ) {
-    let s = unsafe { &mut *slot_at(t, c, i) };
-    let _g = lock_slot(&s.lock);
-    s.seq.fetch_add(1, Ordering::Relaxed);
+    let slot = g.slot;
+    let seq = &slot.seq;
+    seq.fetch_add(1, Ordering::Relaxed);
+    let (s, pay) = g.parts();
     s.hash = hash;
     s.target = target;
     s.epoch = epoch;
@@ -417,14 +472,13 @@ fn write_slot(
     s.stored_ms = now;
     s.age_sec = age_sec;
     s.variant = variant;
-    let pay = payload(t, c, i);
     let mut stored = Vec::with_capacity(8 + head.len());
     stored.extend_from_slice(status.to_string().as_bytes());
     stored.push(b'\n');
     stored.extend_from_slice(head);
     if key.len() + stored.len() + body.len() > pay.len() {
         s.hash = 0;
-        s.seq.fetch_add(1, Ordering::Relaxed);
+        seq.fetch_add(1, Ordering::Relaxed);
         return;
     }
     pay[..key.len()].copy_from_slice(key);
@@ -433,7 +487,7 @@ fn write_slot(
     s.key_len = key.len() as u16;
     s.head_len = stored.len() as u16;
     s.body_len = body.len() as u32;
-    s.seq.fetch_add(1, Ordering::Relaxed);
+    seq.fetch_add(1, Ordering::Relaxed);
     crate::metrics::cache_store();
 }
 
@@ -441,14 +495,21 @@ pub fn invalidate(target: u64) {
     let Some((t, classes)) = classes() else {
         return;
     };
+    let now = now_ms();
     for c in classes {
         for i in 0..c.n {
-            let s = unsafe { &mut *slot_at(t, c, i) };
-            let _g = lock_slot(&s.lock);
+            let Some(mut g) = SlotGuard::lock(t, c, i, now) else {
+                // A copy that cannot be reached must still not be served:
+                // retire every copy instead.
+                flush();
+                return;
+            };
+            let slot = g.slot;
+            let seq = &slot.seq;
+            let s = g.data();
             if s.target == target && s.hash != 0 {
-                s.seq.fetch_add(1, Ordering::Relaxed);
                 s.expiry_ms = 0;
-                s.seq.fetch_add(1, Ordering::Relaxed);
+                seq.fetch_add(2, Ordering::Relaxed);
             }
         }
     }
@@ -798,10 +859,125 @@ pub fn stored_etag(head: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    /// The table is process-wide, and some tests retire every copy in it.
+    fn table() -> MutexGuard<'static, ()> {
+        static SERIAL: Mutex<()> = Mutex::new(());
+        let g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        install(2 * 1024 * 1024, 64 * 1024, None).unwrap();
+        g
+    }
+
+    fn put(path: &[u8], body: &[u8]) -> Vec<u8> {
+        let k = key(false, b"localhost", path, None).unwrap();
+        store(
+            &k,
+            target_hash(path),
+            0,
+            200,
+            b"content-type: text/plain
+cache-control: max-age=60
+",
+            body,
+            60,
+            0,
+        );
+        k
+    }
+
+    /// The slot holding `k`.
+    fn slot_of(k: &[u8]) -> &'static Slot {
+        let (t, classes) = classes().unwrap();
+        let hash = fnv(k);
+        for c in classes {
+            if c.n == 0 {
+                continue;
+            }
+            for p in 0..8 {
+                let i = (hash as usize % c.n + p) % c.n;
+                let mut g = SlotGuard::lock(t, c, i, now_ms()).unwrap();
+                let (s, pay) = g.parts();
+                if s.hash == hash && pay.get(..s.key_len as usize) == Some(k) {
+                    return g.slot;
+                }
+            }
+        }
+        panic!("not stored");
+    }
+
+    #[test]
+    fn busy_slot_is_a_miss_not_a_wait() {
+        let _serial = table();
+        let k = put(b"/busy", b"busy");
+        let slot = slot_of(&k);
+        // A live worker holding the slot.
+        slot.lock.store(now_ms(), Ordering::Relaxed);
+        let t = std::time::Instant::now();
+        assert!(lookup(&k, 0, None).is_none());
+        assert!(t.elapsed() < std::time::Duration::from_millis(500));
+        // Its copy cannot be reached to retire it, so every copy goes.
+        let before = generation();
+        invalidate(target_hash(b"/busy"));
+        assert!(generation() > before);
+        slot.lock.store(0, Ordering::Relaxed);
+        assert!(lookup(&k, 0, None).is_none());
+    }
+
+    #[test]
+    fn slot_of_a_dead_worker_is_taken_over() {
+        let _serial = table();
+        let k = put(b"/dead-reader", b"intact");
+        let slot = slot_of(&k);
+        slot.lock
+            .store(now_ms() - STALE_MS - 1000, Ordering::Relaxed);
+        assert_eq!(lookup(&k, 0, None).expect("hit").body, b"intact");
+        assert_eq!(slot.lock.load(Ordering::Relaxed), 0);
+
+        let k = put(b"/dead-writer", b"torn");
+        let slot = slot_of(&k);
+        // Died part way through a write.
+        slot.seq.fetch_add(1, Ordering::Relaxed);
+        slot.lock
+            .store(now_ms() - STALE_MS - 1000, Ordering::Relaxed);
+        assert!(lookup(&k, 0, None).is_none());
+        assert_eq!(slot.seq.load(Ordering::Relaxed) & 1, 0);
+        put(b"/dead-writer", b"again");
+        assert_eq!(lookup(&k, 0, None).expect("hit").body, b"again");
+    }
+
+    #[test]
+    fn concurrent_workers_see_whole_copies() {
+        let _serial = table();
+        let threads: Vec<_> = (0..if cfg!(miri) { 3u8 } else { 8 })
+            .map(|n| {
+                std::thread::spawn(move || {
+                    let rounds = if cfg!(miri) { 12 } else { 400 };
+                    for round in 0..rounds {
+                        let path = format!("/c{}", (round + n as u32) % 16);
+                        let body = path.repeat(1 + (round as usize % 50));
+                        put(path.as_bytes(), body.as_bytes());
+                        let k = key(false, b"localhost", path.as_bytes(), None).unwrap();
+                        if let Some(hit) = lookup(&k, 0, None) {
+                            let text = String::from_utf8(hit.body).unwrap();
+                            assert!(!text.is_empty() && text.len().is_multiple_of(path.len()));
+                            assert_eq!(text.replace(&path, ""), "", "{path}: {text}");
+                        }
+                        if round % 97 == 0 {
+                            invalidate(target_hash(path.as_bytes()));
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+    }
 
     #[test]
     fn store_and_hit() {
-        install(2 * 1024 * 1024, 64 * 1024, None).unwrap();
+        let _serial = table();
         let key = key(false, b"localhost", b"/fresh", None).unwrap();
         store(
             &key,
@@ -878,7 +1054,7 @@ mod tests {
 
     #[test]
     fn store_ranks_under_lock() {
-        install(2 * 1024 * 1024, 64 * 1024, None).unwrap();
+        let _serial = table();
         let key = key(false, b"localhost", b"/locked", None).unwrap();
         store(
             &key,
@@ -902,6 +1078,17 @@ mod tests {
         );
         let hit = lookup(&key, 0, None).expect("hit");
         assert_eq!(hit.body, b"two");
+    }
+
+    #[test]
+    fn slots_are_aligned_for_their_atomics() {
+        for max_object in [1000, 64 * 1024 + 3, 1024 * 1024] {
+            let (small, large) = layout(8 * 1024 * 1024, max_object);
+            for c in [small, large] {
+                assert_eq!(c.off % 8, 0);
+                assert_eq!(c.slot % 8, 0);
+            }
+        }
     }
 
     #[test]
