@@ -17,8 +17,50 @@ Distribution name: `weft-server`. Import package `weft`, CLI `weft`.
 
 ## Unreleased
 
-The tree on `master` for the first PyPI release (`weft-server` 0.1.0).
-Tag `v0.1.0` to publish.
+---
+
+## 0.1.1 — 2026-10-23
+
+### Fixed
+
+- Process workers: the first Ctrl+C no longer hangs the supervisor
+  (workers are signalled over pipes, not `multiprocessing.Event`; #1,
+  thanks @patx). SIGTERM to the supervisor or the thread-worker controller
+  now drains gracefully, including `--drain-delay` and lifespan shutdown.
+  A worker that outlives SIGTERM is killed and reaped; workers already
+  started are stopped when a later one fails to start.
+- Unix sockets: every client was reset on accept; they are now served.
+- HTTP/2 and HTTP/3: request bodies stream to the app after dispatch
+  instead of being buffered first, so early responses and
+  `--request-timeout` work, and an oversized HTTP/2 body gets 413. Large
+  HTTP/3 uploads to a slow app are no longer cut off. Static files are
+  sent whole (they were truncated after 64 KiB). An h2 app gets
+  `http.disconnect` when the client leaves after the body was read. A
+  cleartext h2 preface split across reads is no longer taken for HTTP/1.
+- WSGI: `write()` no longer stalls on HTTP/2 and HTTP/3, and
+  `SERVER_PROTOCOL` reports HTTP/2 there. A one-block list response no
+  longer sends `Content-Length` twice.
+- Response cache: a body that does not match its `Content-Length` is not
+  cached; responses are aged by their `Date`; `Accept-Encoding` variants
+  no longer leak into each other or evict each other; requests with a
+  body skip the cache-hit path (their body was parsed as the next
+  request); shared slots are safe when a worker holding one pauses or
+  dies.
+- Static files: a file that shrinks or fails mid-read resets the stream or
+  closes the connection instead of looking complete; a precompressed
+  file's ETag comes from that file.
+
+### Changed
+
+- WSGI over HTTP/1 keep-alive sends finished responses with the rest of
+  their batch: about 1.25× requests/s at saturation and lower p99 on the
+  minimal WSGI benchmark. ASGI unchanged.
+
+---
+
+## 0.1.0 — 2026-09-28
+
+The first PyPI release.
 
 ### Added
 
