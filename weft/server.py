@@ -282,15 +282,46 @@ def _run_threads(config: Config, sock, n: int) -> int:
     return max(codes, default=0)
 
 
+class _Flag:
+    """A one-shot signal between the supervisor and one worker process, over a
+    pipe. A `multiprocessing.Event` deadlocks here: its `set()` waits for every
+    waiter to wake, and a worker that exits while a thread of it waits never
+    does (Ctrl+C reaches the workers too, and they leave first). Setting this
+    one only writes to a pipe. Its reader sees it set on data or on EOF, so
+    the flags of a supervisor that dies are set as well.
+
+    The setter keeps both ends; the other process is sent only its own, or
+    the pipe could not end while that process lives."""
+
+    def __init__(self, ctx, child_sets: bool = False):
+        self._r, self._w = ctx.Pipe(duplex=False)
+        self._child_sets = child_sets
+
+    def __getstate__(self):
+        if self._child_sets:
+            return {'_r': None, '_w': self._w, '_child_sets': True}
+        return {'_r': self._r, '_w': None, '_child_sets': False}
+
+    def set(self) -> None:
+        w, self._w = self._w, None
+        if w is None:
+            return
+        try:
+            w.send_bytes(b'1')
+        except OSError:
+            pass
+        w.close()
+
+    def is_set(self) -> bool:
+        return self.wait(0)
+
+    def wait(self, timeout: float | None = None) -> bool:
+        return bool(multiprocessing.connection.wait([self._r], timeout))
+
+
 def _process_main(config: Config, sock, stop, quit, ready, index: int) -> None:
     log.configure(config.log_level)
-    parent = multiprocessing.parent_process()
-    if parent is not None:
-        def orphaned():
-            multiprocessing.connection.wait([parent.sentinel])
-            quit.set()
-
-        threading.Thread(target=orphaned, name='weft-parent-watch', daemon=True).start()
+    # `stop` and `quit` are `_Flag`s: they are set if the supervisor dies.
     config.metrics_slot = index
     config.metrics_listen = index == 0
     config.http3_listen = index == 0 if os.name == 'nt' else True
@@ -383,7 +414,7 @@ def _run_supervisor(config: Config, sock, n: int) -> int:
     watcher = _Watcher(_watch_roots(config), config.reload_interval) if config.reload else None
 
     def spawn(i: int) -> _Slot:
-        stop, quit, ready = ctx.Event(), ctx.Event(), ctx.Event()
+        stop, quit, ready = _Flag(ctx), _Flag(ctx), _Flag(ctx, child_sets=True)
         p = ctx.Process(target=_process_main, args=(config, sock, stop, quit, ready, i), name=f'weft-worker-{i}')
         p.start()
         deadline = time.monotonic() + 60

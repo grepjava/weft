@@ -366,7 +366,7 @@ def test_supervisor_stops_started_workers_when_a_later_one_fails(monkeypatch):
             self.alive = False
 
     class Ctx:
-        Event = threading.Event
+        Pipe = staticmethod(multiprocessing.Pipe)
         Process = Proc
 
     monkeypatch.setattr(multiprocessing, 'get_context', lambda method: Ctx)
@@ -384,13 +384,14 @@ def test_supervisor_reaps_a_worker_interrupted_while_starting(monkeypatch):
 
     procs = []
 
-    class Ready(threading.Event):
-        def wait(self, timeout=None):
-            raise KeyboardInterrupt
+    def interrupted(timeout=None):
+        raise KeyboardInterrupt
 
     class Proc:
         def __init__(self, target, args, name):
             self.quit = args[3]
+            # spawn() waits on ready next: that wait is interrupted.
+            args[4].wait = interrupted
             self.alive = False
             self.exitcode = None
             self.pid = 1000
@@ -413,17 +414,9 @@ def test_supervisor_reaps_a_worker_interrupted_while_starting(monkeypatch):
         def kill(self):
             self.alive = False
 
-    made = []
-
-    def event():
-        # spawn() makes stop, quit, then ready: waiting on ready is interrupted.
-        e = Ready() if len(made) % 3 == 2 else threading.Event()
-        made.append(e)
-        return e
-
     class Ctx:
+        Pipe = staticmethod(multiprocessing.Pipe)
         Process = Proc
-        Event = staticmethod(event)
 
     monkeypatch.setattr(multiprocessing, 'get_context', lambda method: Ctx)
     with pytest.raises(KeyboardInterrupt):
@@ -431,6 +424,47 @@ def test_supervisor_reaps_a_worker_interrupted_while_starting(monkeypatch):
     assert len(procs) == 1
     assert procs[0].quit.is_set()
     assert not procs[0].alive
+
+
+def _wait_then_leave(flag) -> None:
+    threading.Thread(target=flag.wait, daemon=True).start()
+    time.sleep(0.3)
+
+
+def test_flag_set_does_not_wait_for_a_worker_that_left():
+    """A worker that exits while a thread of it waits on a flag must not block
+    the supervisor setting it, as a `multiprocessing.Event` would (issue #1)."""
+    import multiprocessing
+
+    from weft.server import _Flag
+
+    ctx = multiprocessing.get_context('spawn')
+    flag = _Flag(ctx)
+    p = ctx.Process(target=_wait_then_leave, args=(flag,))
+    p.start()
+    p.join(30)
+    assert p.exitcode == 0
+    t = threading.Thread(target=flag.set, daemon=True)
+    t.start()
+    t.join(5)
+    assert not t.is_alive()
+    assert flag.is_set()
+
+
+@pytest.mark.skipif(sys.platform == 'win32', reason='needs a POSIX process group')
+def test_ctrl_c_stops_process_workers():
+    """Ctrl+C reaches the supervisor and every worker at once (issue #1)."""
+    import signal
+
+    with serve_process('tests.apps.basic:app', '--workers', '4', start_new_session=True) as (url, proc):
+        pids = set()
+        for _ in range(200):
+            pids.add(int(httpx.get(url + '/pid').text))
+            if len(pids) == 4:
+                break
+        os.killpg(proc.pid, signal.SIGINT)
+        assert proc.wait(15) == 0
+    assert not [p for p in pids if _alive(p)]
 
 
 def test_reap_kills_a_worker_that_ignores_sigterm():

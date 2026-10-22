@@ -24,8 +24,8 @@ _startup_lock = threading.Lock()
 def run(config: Config, sock, stop=None, app=None, exclusive=False, ready=None, quit=None) -> int:
     """Serves on `sock` from this thread until stopped; returns an exit code.
 
-    `stop` is anything with a blocking `wait()` (a `threading.Event`, a
-    multiprocessing one) that tells the worker to shut down gracefully.
+    `stop` is anything with a blocking `wait()` (a `threading.Event`, the
+    supervisor's `_Flag`) that tells the worker to shut down gracefully.
     `exclusive` promises that no other worker accepts from `sock`.
     """
     config.prepare()

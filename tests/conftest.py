@@ -76,8 +76,9 @@ def wait_port(port: int, timeout: float = 20.0) -> None:
 
 
 @contextmanager
-def serve_process(app: str, *args: str, python: str | None = None, env: dict | None = None):
-    """Runs the CLI in a subprocess; yields (base URL, process)."""
+def serve_process(app: str, *args: str, python: str | None = None, env: dict | None = None, **popen):
+    """Runs the CLI in a subprocess; yields (base URL, process). Extra keyword
+    arguments go to `subprocess.Popen`."""
     port = free_port()
     proc = subprocess.Popen(
         [python or sys.executable, '-m', 'weft', app, '--port', str(port), '--log-level', 'warning', *args],
@@ -85,6 +86,7 @@ def serve_process(app: str, *args: str, python: str | None = None, env: dict | N
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         env={**os.environ, 'PYTHONUNBUFFERED': '1', **(env or {})},
+        **popen,
     )
     try:
         if '--tls-cert' in args:
