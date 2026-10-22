@@ -552,7 +552,15 @@ impl Core {
         }
         #[cfg(unix)]
         let _ = exclusive;
-        let listener = TcpListener::from_std(dup_listener(fd)?)?;
+        #[cfg(unix)]
+        let listener = if unix {
+            let std = std::os::unix::net::UnixListener::from(std::os::fd::OwnedFd::from(dup_socket(fd)?));
+            Listener::Unix(tokio::net::UnixListener::from_std(std)?)
+        } else {
+            Listener::Tcp(TcpListener::from_std(dup_socket(fd)?.into())?)
+        };
+        #[cfg(windows)]
+        let listener = Listener::Tcp(TcpListener::from_std(dup_socket(fd)?.into())?);
         self.start(ctx);
         self.rt
             .spawn_local(accept_loop(self.sh.clone(), listener, unix));
@@ -671,13 +679,38 @@ fn borrow_socket(fd: i64) -> std::mem::ManuallyDrop<socket2::Socket> {
     std::mem::ManuallyDrop::new(s)
 }
 
-fn dup_listener(fd: i64) -> std::io::Result<std::net::TcpListener> {
+fn dup_socket(fd: i64) -> std::io::Result<socket2::Socket> {
     let s = borrow_socket(fd).try_clone()?;
     s.set_nonblocking(true)?;
-    Ok(s.into())
+    Ok(s)
 }
 
-async fn accept_loop(sh: Rc<Shared>, listener: TcpListener, unix: bool) {
+/// A TCP or unix listener. Tokio's TCP accept cannot take a unix connection:
+/// it rejects the peer address and drops the stream, so the client sees a
+/// reset. A unix stream is then served as a `TcpStream`, whose I/O is the same.
+enum Listener {
+    Tcp(TcpListener),
+    #[cfg(unix)]
+    Unix(tokio::net::UnixListener),
+}
+
+impl Listener {
+    async fn accept(&self) -> std::io::Result<(tokio::net::TcpStream, SocketAddr)> {
+        match self {
+            Listener::Tcp(l) => l.accept().await,
+            #[cfg(unix)]
+            Listener::Unix(l) => {
+                use std::os::fd::{FromRawFd, IntoRawFd};
+                let (s, _) = l.accept().await?;
+                let fd = s.into_std()?.into_raw_fd();
+                let s = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+                Ok((tokio::net::TcpStream::from_std(s)?, SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0))))
+            }
+        }
+    }
+}
+
+async fn accept_loop(sh: Rc<Shared>, listener: Listener, unix: bool) {
     loop {
         let mut stop = pin!(sh.stop.notified());
         stop.as_mut().enable();
@@ -688,10 +721,7 @@ async fn accept_loop(sh: Rc<Shared>, listener: TcpListener, unix: bool) {
             biased;
             _ = &mut stop => return,
             r = listener.accept() => match r {
-                Ok((io, peer)) => {
-                    let peer = if unix { SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0)) } else { peer };
-                    sh.admit(io, peer, unix);
-                }
+                Ok((io, peer)) => sh.admit(io, peer, unix),
                 // Out of descriptors, most likely: back off rather than spin.
                 Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
             },
