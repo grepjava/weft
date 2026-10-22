@@ -1433,6 +1433,15 @@ pub(crate) fn pump(
         {
             // The stream ended short of its Content-Length.
             *eof = true;
+        } else if !want_frames
+            && p.stream_body.is_some()
+            && !st.disconnected
+            && st.resp.phase != Phase::Done
+            && conn.h2.borrow_mut().as_mut().is_some_and(|tx| tx.poll_gone(cx))
+        {
+            // With no body left to read, a reset (or the connection closing)
+            // is the only sign the client has gone, as EOF is for HTTP/1.
+            *eof = true;
         }
         // Read until the socket would block, so that Tokio's readiness is
         // cleared and a waker registered; `want_read` bounds the buffering.

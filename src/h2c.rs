@@ -87,6 +87,19 @@ impl H2Tx {
 }
 
 impl H2Tx {
+    /// Whether the client reset the stream or the connection under it went
+    /// away; until then the calling task is woken when either happens.
+    pub fn poll_gone(&mut self, cx: &mut Context<'_>) -> bool {
+        let r = if let Some(s) = self.send.as_mut() {
+            s.poll_reset(cx)
+        } else if let Some(r) = self.respond.as_mut() {
+            r.poll_reset(cx)
+        } else {
+            return false;
+        };
+        r.is_ready()
+    }
+
     pub fn reset(&mut self) {
         if let Some(mut r) = self.respond.take() {
             r.send_reset(h2::Reason::INTERNAL_ERROR);

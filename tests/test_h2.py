@@ -291,3 +291,46 @@ def test_h2c_preface_in_pieces():
             assert not data.startswith(b'HTTP/1.1')
             assert data[3] == 0x4  # the server's SETTINGS frame
 
+
+def _h2c_wait_disconnect(url, end):
+    import h2.config
+    import h2.connection
+    from urllib.parse import urlparse
+
+    from tests.apps.basic import app
+
+    before = getattr(app, 'disconnected', 0)
+    u = urlparse(url)
+    sock = socket.create_connection((u.hostname, u.port), timeout=5)
+    conn = h2.connection.H2Connection(h2.config.H2Configuration(client_side=True))
+    conn.initiate_connection()
+    conn.send_headers(1, [
+        (':method', 'GET'), (':path', '/wait-disconnect'), (':scheme', 'http'),
+        (':authority', f'{u.hostname}:{u.port}'),
+    ], end_stream=True)
+    sock.sendall(conn.data_to_send())
+    time.sleep(0.3)
+    end(sock, conn)
+    deadline = time.monotonic() + 5
+    while getattr(app, 'disconnected', 0) == before:
+        assert time.monotonic() < deadline, 'the application never saw http.disconnect'
+        time.sleep(0.05)
+    sock.close()
+
+
+def test_h2_reset_after_body_reaches_app():
+    from tests.apps.basic import app
+
+    def reset(sock, conn):
+        conn.reset_stream(1)
+        sock.sendall(conn.data_to_send())
+
+    with serve_thread(app) as url:
+        _h2c_wait_disconnect(url, reset)
+
+
+def test_h2_connection_close_after_body_reaches_app():
+    from tests.apps.basic import app
+
+    with serve_thread(app) as url:
+        _h2c_wait_disconnect(url, lambda sock, conn: sock.close())
