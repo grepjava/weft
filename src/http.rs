@@ -924,11 +924,22 @@ async fn run(sh: Rc<Shared>, conn: Rc<Conn>) {
             return;
         }
         if ctx.http2 && alpn.is_none() {
-            match read_some(&sh, &conn, &mut rbuf, ctx.header_timeout, false).await {
-                Some(n) if n > 0 => {}
-                _ => {
-                    teardown(&sh, &conn, &mut rbuf).await;
-                    return;
+            // TCP keeps no write boundaries: read on while what came so far
+            // could still be the start of the preface.
+            let deadline = tokio::time::Instant::now() + ctx.header_timeout;
+            loop {
+                let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                match read_some(&sh, &conn, &mut rbuf, left, false).await {
+                    Some(n) if n > 0 => {}
+                    _ => {
+                        teardown(&sh, &conn, &mut rbuf).await;
+                        return;
+                    }
+                }
+                if rbuf.len() >= crate::h2c::PREFACE.len()
+                    || !crate::h2c::PREFACE.starts_with(&rbuf)
+                {
+                    break;
                 }
             }
             if rbuf.starts_with(crate::h2c::PREFACE) {

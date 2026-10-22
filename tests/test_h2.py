@@ -269,3 +269,25 @@ def test_h2_wsgi_large_write(tmp_path):
             assert r.content == b'w' * (1024 * 1024) + b'end'
             # The worker is still serving.
             assert c.get(url.replace('http://', 'https://') + '/').status_code == 200
+
+
+def test_h2c_preface_in_pieces():
+    """TCP keeps no write boundaries: a preface arriving in parts is still
+    HTTP/2, not a bad HTTP/1 request."""
+    from urllib.parse import urlparse
+
+    from tests.apps.basic import app
+
+    PREFACE = b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n'
+    SETTINGS = b'\x00\x00\x00\x04\x00\x00\x00\x00\x00'  # empty SETTINGS, stream 0
+
+    with serve_thread(app) as url:
+        u = urlparse(url)
+        with socket.create_connection((u.hostname, u.port), timeout=5) as sock:
+            sock.sendall(PREFACE[:3])
+            time.sleep(0.2)
+            sock.sendall(PREFACE[3:] + SETTINGS)
+            data = sock.recv(65535)
+            assert not data.startswith(b'HTTP/1.1')
+            assert data[3] == 0x4  # the server's SETTINGS frame
+
