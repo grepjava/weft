@@ -377,6 +377,62 @@ def test_supervisor_stops_started_workers_when_a_later_one_fails(monkeypatch):
     assert not procs[0].alive
 
 
+def test_supervisor_reaps_a_worker_interrupted_while_starting(monkeypatch):
+    import multiprocessing
+
+    from weft import server
+
+    procs = []
+
+    class Ready(threading.Event):
+        def wait(self, timeout=None):
+            raise KeyboardInterrupt
+
+    class Proc:
+        def __init__(self, target, args, name):
+            self.quit = args[3]
+            self.alive = False
+            self.exitcode = None
+            self.pid = 1000
+            procs.append(self)
+
+        def start(self):
+            self.alive = True
+
+        def is_alive(self):
+            return self.alive
+
+        def join(self, timeout=None):
+            if self.quit.is_set():
+                self.alive = False
+                self.exitcode = 0
+
+        def terminate(self):
+            self.alive = False
+
+        def kill(self):
+            self.alive = False
+
+    made = []
+
+    def event():
+        # spawn() makes stop, quit, then ready: waiting on ready is interrupted.
+        e = Ready() if len(made) % 3 == 2 else threading.Event()
+        made.append(e)
+        return e
+
+    class Ctx:
+        Process = Proc
+        Event = staticmethod(event)
+
+    monkeypatch.setattr(multiprocessing, 'get_context', lambda method: Ctx)
+    with pytest.raises(KeyboardInterrupt):
+        server._run_supervisor(Config(app='tests.apps.basic:app', workers=1), None, 1)
+    assert len(procs) == 1
+    assert procs[0].quit.is_set()
+    assert not procs[0].alive
+
+
 def test_reap_kills_a_worker_that_ignores_sigterm():
     from weft.server import _reap
 

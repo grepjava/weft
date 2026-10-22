@@ -387,11 +387,19 @@ def _run_supervisor(config: Config, sock, n: int) -> int:
         p = ctx.Process(target=_process_main, args=(config, sock, stop, quit, ready, i), name=f'weft-worker-{i}')
         p.start()
         deadline = time.monotonic() + 60
-        while time.monotonic() < deadline:
-            if ready.wait(0.1):
-                return _Slot(p, stop, quit)
-            if not p.is_alive():
-                raise RuntimeError(f'worker {i} exited with {p.exitcode} before it started serving')
+        try:
+            while time.monotonic() < deadline:
+                if ready.wait(0.1):
+                    return _Slot(p, stop, quit)
+                if not p.is_alive():
+                    raise RuntimeError(f'worker {i} exited with {p.exitcode} before it started serving')
+        except BaseException:
+            # Interrupted while it starts: it is in no slot yet, so nothing
+            # else would stop it.
+            quit.set()
+            p.join(5)
+            _reap(p)
+            raise
         quit.set()
         p.join(5)
         _reap(p)
