@@ -84,6 +84,10 @@ pub fn thread_key() -> usize {
 
 /// Everything a request needs from the application side, fixed at `serve`.
 pub struct AppCtx {
+    /// Run HTTP tasks eagerly (Python 3.12+). Off unless `WEFT_EAGER_TASKS=1`:
+    /// it lowers p50 at moderate load but cost FastAPI ~8% throughput at
+    /// saturation (interleaved A/B, 2026-11-25), and ASGI gained nothing.
+    pub eager: bool,
     pub app: PyRef,
     pub loop_: PyRef,
     pub task_type: PyRef,

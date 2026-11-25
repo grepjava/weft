@@ -683,6 +683,7 @@ method!(w_serve, |o, args, nargs| {
         quic,
         alt_svc,
         h3_extensions,
+        eager: std::env::var_os("WEFT_EAGER_TASKS").is_some_and(|v| v == "1"),
     };
     let access_log_file = match opt(opts, c"access_log_file")? {
         Some(v) if !py::str_view(v)?.is_empty() => {

@@ -91,6 +91,7 @@ Comprehensive code audit of `src/` and `weft/` with exact file/line references, 
   - `fmt_hex` in `StreamBody::push` (`src/http.rs:1161-1172`), interned `i.https` (`src/asgi.rs:640`, `src/wsgi.rs:235`), and stack `[u8; 20]` for `CONTENT_LENGTH` (`src/wsgi.rs:841-855`).
 - [x] **Eager ASGI coroutine execution (`Task(..., eager_start=True)` on 3.12+)** (`src/asgi.rs:461-480, 790-845, 1425-1510`, `src/lib.rs:302-328`)
   - Fast HTTP endpoints finish inline without allocating `TaskDone`, without `add_done_callback`, without `py_scheduled()`, and skip `http::pump` (and its extra `WouldBlock` `recv()`), while preserving full `asyncio.current_task()` semantics.
+  - **Now opt-in (`WEFT_EAGER_TASKS=1`).** An interleaved A/B (Windows, 1 worker, 256 connections, 8 rounds) showed eager start cost FastAPI hello ~8% req/s at saturation (9.8k vs 10.7k with it off) and gained nothing on raw ASGI; its only win was a lower p50 at moderate load.
 - [x] **Asyncio-free WSGI runner & native C `WsgiInput`** (`weft/worker.py:32-125`, `src/wsgi.rs:33-55, 304-570, 1070-1085`)
   - WSGI workers drive Tokio directly via `Worker.select()` without `WeftEventLoop`, `WeftSelector`, or self-pipe; replaced `io.BytesIO` with a non-GC-tracked C `WsgiInput` implementing `read`/`readline`/`readlines`/`__iter__`/`__next__`, and looked up `sys.stderr` dynamically via `PySys_GetObject`.
 - [x] **Per-worker object freelists** (`src/types.rs:18-60, 144-180, 275-315`)

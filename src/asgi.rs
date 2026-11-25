@@ -710,7 +710,7 @@ unsafe fn start(
                 },
             )?;
         }
-        launch(sh, ctx, conn, d, receive_vc, send_vc, seq, true)
+        launch(sh, ctx, conn, d, receive_vc, send_vc, seq, ctx.eager)
     }
 }
 
