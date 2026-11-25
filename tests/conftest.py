@@ -75,11 +75,23 @@ def wait_port(port: int, timeout: float = 20.0) -> None:
     raise TimeoutError(f'server on port {port} did not come up')
 
 
+def _default_sigint() -> None:
+    import signal
+
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+
 @contextmanager
 def serve_process(app: str, *args: str, python: str | None = None, env: dict | None = None, **popen):
     """Runs the CLI in a subprocess; yields (base URL, process). Extra keyword
     arguments go to `subprocess.Popen`."""
     port = free_port()
+    if os.name == 'posix':
+        # Start the server with SIGINT at its default, as from a terminal: a
+        # pytest run launched in the background (`cmd &` in a non-interactive
+        # shell) inherits SIGINT ignored, which Python keeps, so the tests
+        # that send Ctrl+C would wrongly see the server ignore it.
+        popen.setdefault('preexec_fn', _default_sigint)
     proc = subprocess.Popen(
         [python or sys.executable, '-m', 'weft', app, '--port', str(port), '--log-level', 'warning', *args],
         cwd=ROOT,
