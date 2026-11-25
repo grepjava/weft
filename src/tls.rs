@@ -147,7 +147,23 @@ impl Io {
         let mut g = self.tls.borrow_mut();
         let Some(t) = g.as_mut() else {
             drop(g);
-            return self.tcp.try_read_buf(buf);
+            #[cfg(unix)]
+            let space = buf.capacity() - buf.len();
+            let n = self.tcp.try_read_buf(buf)?;
+            // A short read emptied the socket's receive queue. Clear tokio's
+            // cached readiness now, without a syscall, instead of learning it
+            // from a read that returns EAGAIN: that read happened once per
+            // request (the disconnect watch while the app runs). Data that
+            // arrives meanwhile raises a new epoll edge, so nothing is lost.
+            // Unix only: mio on Windows re-arms its poll only after a real
+            // WouldBlock, so there the flag must be cleared by one.
+            #[cfg(unix)]
+            if n > 0 && n < space {
+                let _ = self.tcp.try_io(Interest::READABLE, || {
+                    Err::<(), _>(io::ErrorKind::WouldBlock.into())
+                });
+            }
+            return Ok(n);
         };
         if t.plain.is_empty() && !t.peer_closed {
             match pull_tls(&self.tcp, t) {
