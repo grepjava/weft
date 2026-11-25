@@ -152,8 +152,13 @@ def test_input_rewinds_like_bytesio(wsgi):
 def test_write_callable_to_slow_reader(wsgi):
     # The worker blocks in write() until the slow client drains the socket.
     u = urlparse(wsgi)
-    with socket.create_connection((u.hostname, u.port), timeout=10) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16384)
+    s = socket.socket()
+    # Small receive buffer set before connect, so the window is negotiated
+    # with it: shrunk after connect, Linux crawls at ~150 KB/s on loopback.
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16384)
+    s.settimeout(10)
+    s.connect((u.hostname, u.port))
+    with s:
         s.sendall(b'GET /write-big HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n')
         import time
 
