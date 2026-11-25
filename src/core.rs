@@ -630,7 +630,12 @@ impl Core {
         if CURRENT.get() == Rc::as_ptr(&self.sh) {
             CURRENT.set(ptr::null());
         }
-        crate::ops::flush_log();
+        // Waiting on the log writer needs no Python: let other threads run.
+        unsafe {
+            let ts = pyo3_ffi::PyEval_SaveThread();
+            crate::ops::sync_log();
+            pyo3_ffi::PyEval_RestoreThread(ts);
+        }
         let Core { rt, sh, .. } = self;
         #[cfg(windows)]
         sh.acceptor.borrow_mut().take();

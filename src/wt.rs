@@ -1111,7 +1111,8 @@ fn send_on(ctx: &AppCtx, conn: Option<&Conn>, id: u64, data: &[u8], end: bool) -
         if end {
             st.end_queued.set(true);
         }
-        st.kick.notify_one();
+        // Both run_h3send and run_h3recv park on this Notify: wake every waiter.
+        st.kick.notify_waiters();
         Ok(ctx.done.clone())
     }
 }

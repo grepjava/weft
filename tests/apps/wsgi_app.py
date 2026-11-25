@@ -48,6 +48,34 @@ def app(environ, start_response):
         write(b'written;')
         return [b'returned']
 
+    if path == '/rewind':
+        # What body-logging middleware does: read, rewind, let the app read.
+        inp = environ['wsgi.input']
+        first = inp.read()
+        assert inp.tell() == len(first)
+        assert inp.seek(0) == 0
+        buf = bytearray(4)
+        n = inp.readinto(buf)
+        inp.seek(0)
+        again = inp.read()
+        out = {
+            'same': first == again,
+            'readinto': bytes(buf[:n]).decode(),
+            'end': inp.seek(0, 2),
+            'readable': inp.readable() and inp.seekable(),
+            'value': inp.getvalue() == first,
+        }
+        inp.close()
+        return _json(start_response, out)
+
+    if path == '/write-big':
+        # More than the socket takes at once, through write(): the worker
+        # has to wait for the client to drain it.
+        write = start_response('200 OK', [('Content-Length', str(8 << 20))])
+        for _ in range(8):
+            write(b'w' * (1 << 20))
+        return []
+
     if path == '/declared':
         start_response('200 OK', [('Content-Length', '5')])
         return [b'hello world']

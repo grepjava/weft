@@ -467,6 +467,58 @@ def test_ctrl_c_stops_process_workers():
     assert not [p for p in pids if _alive(p)]
 
 
+def test_signal_stops_idle_single_wsgi_worker():
+    """An idle single-process WSGI worker blocks in the native select();
+    a signal must still wake it and stop it."""
+    import signal
+    import subprocess
+
+    if sys.platform == 'win32':
+        popen = {'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP}
+        sig = signal.CTRL_BREAK_EVENT
+    else:
+        popen = {}
+        sig = signal.SIGINT
+    with serve_process('tests.apps.wsgi_app:app', '--interface', 'wsgi', **popen) as (url, proc):
+        time.sleep(0.5)  # let it go idle in select()
+        proc.send_signal(sig)
+        assert proc.wait(10) == 0
+
+
+def test_second_signal_during_wsgi_shutdown_does_not_spin():
+    """A signal during the graceful wait leaves a byte on the wakeup socket;
+    unless it is drained, every select returns at once and the worker spins."""
+    import signal
+    import subprocess
+
+    psutil = pytest.importorskip('psutil')
+    if sys.platform == 'win32':
+        popen = {'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP}
+        sig = signal.CTRL_BREAK_EVENT
+    else:
+        popen = {}
+        sig = signal.SIGTERM
+    args = ('--interface', 'wsgi', '--graceful-timeout', '4')
+    with serve_process('tests.apps.wsgi_app:app', *args, **popen) as (url, proc):
+        port = int(url.rsplit(':', 1)[1])
+        # A request still in flight (its body never comes) keeps the worker
+        # in its graceful wait.
+        held = socket.create_connection(('127.0.0.1', port))
+        held.sendall(b'POST /echo HTTP/1.1\r\nhost: x\r\ncontent-length: 10\r\n\r\n')
+        time.sleep(0.3)
+        proc.send_signal(sig)
+        time.sleep(0.3)
+        proc.send_signal(sig)
+        time.sleep(0.2)
+        p = psutil.Process(proc.pid)
+        before = sum(p.cpu_times()[:2])
+        time.sleep(1.0)
+        used = sum(p.cpu_times()[:2]) - before
+        held.close()
+        assert proc.wait(10) == 0
+        assert used < 0.5, f'worker used {used:.2f}s of CPU in 1s while waiting'
+
+
 def test_reap_kills_a_worker_that_ignores_sigterm():
     from weft.server import _reap
 

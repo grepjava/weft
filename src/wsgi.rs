@@ -464,6 +464,103 @@ unsafe extern "C" fn input_iternext(o: *mut PyObject) -> *mut PyObject {
     }
 }
 
+// The rest of the `io.BytesIO` surface that apps and middleware use on
+// `wsgi.input` (rewinding to re-read a body, readinto, ...); the body is
+// all in memory, so these are cheap.
+
+unsafe extern "C" fn input_seek(
+    o: *mut PyObject,
+    args: *mut *mut PyObject,
+    nargs: Py_ssize_t,
+) -> *mut PyObject {
+    unsafe {
+        let inp = &mut *(o as *mut WsgiInputObj);
+        if !(1..=2).contains(&nargs) {
+            py::type_error("seek() takes 1 or 2 arguments");
+            return ptr::null_mut();
+        }
+        let Ok(off) = py::i64_arg(*args) else {
+            return ptr::null_mut();
+        };
+        let whence = if nargs == 2 {
+            match py::i64_arg(*args.add(1)) {
+                Ok(w) => w,
+                Err(_) => return ptr::null_mut(),
+            }
+        } else {
+            0
+        };
+        let len = input_slice(inp).len() as i64;
+        let base = match whence {
+            0 => 0,
+            1 => inp.pos as i64,
+            2 => len,
+            _ => {
+                py::raise(PyExc_ValueError, &format!("invalid whence ({whence}, should be 0, 1 or 2)"));
+                return ptr::null_mut();
+            }
+        };
+        if whence == 0 && off < 0 {
+            py::raise(PyExc_ValueError, &format!("negative seek value {off}"));
+            return ptr::null_mut();
+        }
+        let new = base.saturating_add(off).max(0);
+        // Like BytesIO, a position past the end is allowed; reads there are empty.
+        inp.pos = new as usize;
+        match py::int(new) {
+            Ok(v) => v.into_ptr(),
+            Err(_) => ptr::null_mut(),
+        }
+    }
+}
+
+unsafe extern "C" fn input_tell(o: *mut PyObject, _: *mut PyObject) -> *mut PyObject {
+    unsafe {
+        let inp = &*(o as *mut WsgiInputObj);
+        match py::int(inp.pos as i64) {
+            Ok(v) => v.into_ptr(),
+            Err(_) => ptr::null_mut(),
+        }
+    }
+}
+
+unsafe extern "C" fn input_true(_: *mut PyObject, _: *mut PyObject) -> *mut PyObject {
+    unsafe { PyRef::borrow(Py_True()).into_ptr() }
+}
+
+unsafe extern "C" fn input_close(_: *mut PyObject, _: *mut PyObject) -> *mut PyObject {
+    unsafe { PyRef::borrow(Py_None()).into_ptr() }
+}
+
+unsafe extern "C" fn input_getvalue(o: *mut PyObject, _: *mut PyObject) -> *mut PyObject {
+    unsafe {
+        let inp = &*(o as *mut WsgiInputObj);
+        PyRef::borrow(inp.data).into_ptr()
+    }
+}
+
+unsafe extern "C" fn input_readinto(o: *mut PyObject, b: *mut PyObject) -> *mut PyObject {
+    unsafe {
+        let inp = &mut *(o as *mut WsgiInputObj);
+        let mut view: Py_buffer = std::mem::zeroed();
+        if PyObject_GetBuffer(b, &mut view, PyBUF_WRITABLE) < 0 {
+            return ptr::null_mut();
+        }
+        let buf = input_slice(inp);
+        let rem = buf.len().saturating_sub(inp.pos);
+        let n = rem.min(view.len.max(0) as usize);
+        if n > 0 {
+            ptr::copy_nonoverlapping(buf.as_ptr().add(inp.pos), view.buf as *mut u8, n);
+            inp.pos += n;
+        }
+        PyBuffer_Release(&mut view);
+        match py::int(n as i64) {
+            Ok(v) => v.into_ptr(),
+            Err(_) => ptr::null_mut(),
+        }
+    }
+}
+
 unsafe fn wsgi_input(body: PyRef) -> PResult<PyRef> {
     unsafe {
         let tp = INPUT_TYPE.get().expect("wsgi::init").0;
@@ -539,6 +636,62 @@ pub unsafe fn init() -> PResult<()> {
                     PyCFunctionFast: input_readlines,
                 },
                 ml_flags: METH_FASTCALL,
+                ml_doc: ptr::null(),
+            },
+            PyMethodDef {
+                ml_name: c"seek".as_ptr(),
+                ml_meth: PyMethodDefPointer {
+                    PyCFunctionFast: input_seek,
+                },
+                ml_flags: METH_FASTCALL,
+                ml_doc: ptr::null(),
+            },
+            PyMethodDef {
+                ml_name: c"tell".as_ptr(),
+                ml_meth: PyMethodDefPointer {
+                    PyCFunction: input_tell,
+                },
+                ml_flags: METH_NOARGS,
+                ml_doc: ptr::null(),
+            },
+            PyMethodDef {
+                ml_name: c"readable".as_ptr(),
+                ml_meth: PyMethodDefPointer {
+                    PyCFunction: input_true,
+                },
+                ml_flags: METH_NOARGS,
+                ml_doc: ptr::null(),
+            },
+            PyMethodDef {
+                ml_name: c"seekable".as_ptr(),
+                ml_meth: PyMethodDefPointer {
+                    PyCFunction: input_true,
+                },
+                ml_flags: METH_NOARGS,
+                ml_doc: ptr::null(),
+            },
+            PyMethodDef {
+                ml_name: c"close".as_ptr(),
+                ml_meth: PyMethodDefPointer {
+                    PyCFunction: input_close,
+                },
+                ml_flags: METH_NOARGS,
+                ml_doc: ptr::null(),
+            },
+            PyMethodDef {
+                ml_name: c"getvalue".as_ptr(),
+                ml_meth: PyMethodDefPointer {
+                    PyCFunction: input_getvalue,
+                },
+                ml_flags: METH_NOARGS,
+                ml_doc: ptr::null(),
+            },
+            PyMethodDef {
+                ml_name: c"readinto".as_ptr(),
+                ml_meth: PyMethodDefPointer {
+                    PyCFunction: input_readinto,
+                },
+                ml_flags: METH_O,
                 ml_doc: ptr::null(),
             },
             unsafe { std::mem::zeroed() },
@@ -931,7 +1084,11 @@ unsafe fn flush_blocking(ctx: &AppCtx, conn: &Conn) -> PResult<()> {
     // forever, so what does not fit now stays queued for that task.
     let multiplexed = conn.io.borrow().is_none();
     loop {
-        let r = crate::http::flush_conn(conn);
+        let r = if multiplexed {
+            crate::http::flush_conn(conn)
+        } else {
+            crate::http::flush_direct(&conn.io(), &mut conn.st.borrow_mut().out)
+        };
         let ok = match r {
             Ok(true) => return Ok(()),
             Ok(false) if multiplexed => return Ok(()),

@@ -144,6 +144,31 @@ def test_write_callable(wsgi):
     assert get(wsgi, '/write').text == 'written;returned'
 
 
+def test_input_rewinds_like_bytesio(wsgi):
+    r = httpx.post(wsgi + '/rewind', content=b'hello body')
+    assert r.json() == {'same': True, 'readinto': 'hell', 'end': 10, 'readable': True, 'value': True}
+
+
+def test_write_callable_to_slow_reader(wsgi):
+    # The worker blocks in write() until the slow client drains the socket.
+    u = urlparse(wsgi)
+    with socket.create_connection((u.hostname, u.port), timeout=10) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16384)
+        s.sendall(b'GET /write-big HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n')
+        import time
+
+        time.sleep(1.0)
+        got = 0
+        while True:
+            b = s.recv(1 << 16)
+            if not b:
+                break
+            got += len(b)
+    assert got > 8 << 20
+    # The worker survived and still answers.
+    assert get(wsgi, '/write').text == 'written;returned'
+
+
 def test_declared_length_is_enforced(wsgi):
     r = get(wsgi, '/declared')
     assert r.content == b'hello'

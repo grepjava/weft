@@ -69,6 +69,22 @@ def test_h2_tls_get(tmp_path):
             assert s['http_version'] == '2'
 
 
+def test_h2_scope_has_no_webtransport_with_http3(tmp_path):
+    # HTTP/3 on the same server must not make HTTP/2 requests claim WebTransport.
+    pytest.importorskip('h2')
+    from tests.apps.basic import app
+
+    _openssl()
+    cert, key = _cert(tmp_path, 'localhost')
+    with serve_thread(app, tls_certs=[str(cert)], tls_keys=[str(key)], http3=True) as url:
+        https = url.replace('http://', 'https://')
+        with httpx.Client(verify=False, http2=True, timeout=5.0) as c:
+            s = c.get(https + '/scope').json()
+            assert s['http_version'] == '2'
+            assert 'webtransport' not in s['extensions']
+            assert 'http.response.pathsend' in s['extensions']
+
+
 def test_h2_hsts(tmp_path):
     from tests.apps.basic import app
 
@@ -334,3 +350,84 @@ def test_h2_connection_close_after_body_reaches_app():
 
     with serve_thread(app) as url:
         _h2c_wait_disconnect(url, lambda sock, conn: sock.close())
+
+
+def test_h2_request_sent_during_shutdown_is_answered():
+    """A request the client sends after shutdown starts, before it has read
+    the server's GOAWAY, still gets its response. Raw frames: the h2 client
+    library refuses to go on once it has read a GOAWAY."""
+    import asyncio
+    import struct
+    import threading
+
+    import hpack
+
+    from weft import worker
+    from weft.config import Config
+    from weft.server import bind
+
+    async def app(scope, receive, send):
+        if scope['type'] != 'http':
+            return
+        if scope['path'] == '/slow':
+            await asyncio.sleep(1.0)
+        await send({'type': 'http.response.start', 'status': 200, 'headers': []})
+        await send({'type': 'http.response.body', 'body': scope['path'].encode()})
+
+    def frame(kind, flags, sid, payload=b''):
+        return struct.pack('>I', len(payload))[1:] + bytes([kind, flags]) + struct.pack('>I', sid) + payload
+
+    sock = bind('127.0.0.1', 0, 16)
+    stop = threading.Event()
+    cfg = Config(app=app, lifespan='off', log_level='critical', graceful_timeout=5.0)
+    t = threading.Thread(target=worker.run, args=(cfg, sock, stop))
+    t.start()
+    port = sock.getsockname()[1]
+    c = socket.create_connection(('127.0.0.1', port), timeout=5)
+    enc = hpack.Encoder()
+
+    def request(sid, path):
+        block = enc.encode([(':method', 'GET'), (':path', path), (':scheme', 'http'),
+                            (':authority', f'127.0.0.1:{port}')])
+        c.sendall(frame(0x1, 0x5, sid, block))  # HEADERS, END_STREAM | END_HEADERS
+
+    try:
+        c.sendall(b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n' + frame(0x4, 0, 0))
+        request(1, '/slow')  # keeps the connection busy through the stop
+        time.sleep(0.3)
+        stop.set()
+        time.sleep(0.3)  # the server has sent GOAWAY and PING; we have not read them
+        request(3, '/late')
+        bodies = {1: b'', 3: b''}
+        ended = set()
+        buf = b''
+        deadline = time.monotonic() + 4.0
+        while ended != {1, 3} and time.monotonic() < deadline:
+            try:
+                data = c.recv(65535)
+            except TimeoutError:
+                break
+            if not data:
+                break
+            buf += data
+            while len(buf) >= 9:
+                n = int.from_bytes(buf[:3], 'big')
+                if len(buf) < 9 + n:
+                    break
+                kind, flags = buf[3], buf[4]
+                sid = int.from_bytes(buf[5:9], 'big') & 0x7FFFFFFF
+                payload, buf = buf[9:9 + n], buf[9 + n:]
+                if kind == 0x4 and not flags & 0x1:
+                    c.sendall(frame(0x4, 0x1, 0))  # SETTINGS ack
+                elif kind == 0x6 and not flags & 0x1:
+                    c.sendall(frame(0x6, 0x1, 0, payload))  # PING ack
+                elif kind == 0x0:
+                    bodies[sid] += payload
+                if kind in (0x0, 0x1) and flags & 0x1:
+                    ended.add(sid)
+        assert bodies == {1: b'/slow', 3: b'/late'}
+    finally:
+        c.close()
+        stop.set()
+        t.join(10)
+        sock.close()

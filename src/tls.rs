@@ -189,6 +189,40 @@ impl Io {
         Ok(n)
     }
 
+    /// `try_write` for a caller blocked in a synchronous call (see
+    /// `DirectTcp`): every write is a real `send()`.
+    pub fn try_write_direct(&self, buf: &[u8]) -> io::Result<usize> {
+        let mut g = self.tls.borrow_mut();
+        let Some(t) = g.as_mut() else {
+            drop(g);
+            return DirectTcp(&self.tcp).write(buf);
+        };
+        flush_tls_with(&mut DirectTcp(&self.tcp), &mut t.conn)?;
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let n = t.conn.writer().write(buf)?;
+        match flush_tls_with(&mut DirectTcp(&self.tcp), &mut t.conn) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            Err(e) => return Err(e),
+        }
+        Ok(n)
+    }
+
+    /// `flush_tls_only` with real `send()`s (see `DirectTcp`).
+    pub fn flush_tls_direct(&self) -> io::Result<bool> {
+        let mut g = self.tls.borrow_mut();
+        let Some(t) = g.as_mut() else {
+            return Ok(true);
+        };
+        match flush_tls_with(&mut DirectTcp(&self.tcp), &mut t.conn) {
+            Ok(()) => Ok(!t.conn.wants_write()),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     pub fn flush_tls_only(&self) -> io::Result<bool> {
         let mut g = self.tls.borrow_mut();
         let Some(t) = g.as_mut() else {
@@ -287,9 +321,12 @@ fn pull_tls(tcp: &TcpStream, t: &mut Tls) -> io::Result<usize> {
 }
 
 fn flush_tls(tcp: &TcpStream, conn: &mut ServerConnection) -> io::Result<()> {
-    let mut w = TryTcp(tcp);
+    flush_tls_with(&mut TryTcp(tcp), conn)
+}
+
+fn flush_tls_with(w: &mut impl Write, conn: &mut ServerConnection) -> io::Result<()> {
     while conn.wants_write() {
-        match conn.write_tls(&mut w) {
+        match conn.write_tls(w) {
             Ok(0) => break,
             Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Err(e),
@@ -310,6 +347,21 @@ impl Read for TryTcp<'_> {
 impl Write for TryTcp<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.0.try_write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Writes with a real `send()`, skipping tokio's readiness cache. Once a
+/// write has hit WouldBlock, tokio answers WouldBlock without trying until
+/// its reactor sees the socket drain, and the reactor cannot run while the
+/// thread is blocked inside a synchronous call.
+struct DirectTcp<'a>(&'a TcpStream);
+
+impl Write for DirectTcp<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        socket2::SockRef::from(self.0).send(buf)
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())

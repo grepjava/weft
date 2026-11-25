@@ -50,6 +50,23 @@ async def app(scope, receive, send):
             'end_stream': True,
         })
 
+    if path == '/wt-paused-send':
+        # Pause reading a bidi stream so its receive task parks, then write
+        # to it twice: both writes must reach the client.
+        import asyncio
+
+        message = await receive()
+        assert message['type'] == 'webtransport.stream.receive', message
+        stream = message['stream']
+        await send({'type': 'webtransport.stream.pause', 'stream': stream})
+        await asyncio.sleep(0.5)
+        await send({'type': 'webtransport.stream.send', 'stream': stream, 'data': b'x', 'end_stream': False})
+        await asyncio.sleep(0.3)
+        await send({'type': 'webtransport.stream.send', 'stream': stream, 'data': b'y', 'end_stream': True})
+        while (await receive())['type'] != 'webtransport.disconnect':
+            pass
+        return
+
     buffers = {}
     while True:
         message = await receive()

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import selectors
 import signal
+import socket
 import sys
 import threading
 import time
@@ -72,7 +74,23 @@ def _run_wsgi(config: Config, app, worker: Worker, sock, stop, exclusive, ready,
         watch(quit, interrupted)
 
     prev_signals: dict = {}
+    # A signal does not interrupt the native select(), and Python runs its
+    # handler only once select() returns. Route signals through a socket
+    # the worker watches so they wake it, as the asyncio path does.
+    wake_r = wake_w = None
+    prev_wakeup_fd = None
     if threading.current_thread() is threading.main_thread():
+        try:
+            wake_r, wake_w = socket.socketpair()
+            wake_r.setblocking(False)
+            wake_w.setblocking(False)
+            worker.register(wake_r.fileno(), selectors.EVENT_READ)
+            prev_wakeup_fd = signal.set_wakeup_fd(wake_w.fileno(), warn_on_full_buffer=False)
+        except (OSError, ValueError, RuntimeError):
+            for s_ in (wake_r, wake_w):
+                if s_ is not None:
+                    s_.close()
+            wake_r = wake_w = None
         sigs = [
             (signal.SIGINT, interrupted),
             (signal.SIGTERM, stopping),
@@ -103,8 +121,15 @@ def _run_wsgi(config: Config, app, worker: Worker, sock, stop, exclusive, ready,
             name = 'unix'
         logger.debug('wsgi worker serving on %s', name)
 
+        def select(timeout):
+            # The wakeup socket is level-triggered: a byte left unread would
+            # make every later select return at once, so drain it whenever
+            # select reports anything, in every loop below.
+            if worker.select(timeout) and wake_r is not None:
+                _drain(wake_r)
+
         while not stopping.is_set():
-            worker.select(None)
+            select(None)
 
         if config.drain_delay > 0 and not interrupted.is_set():
             worker.drain()
@@ -114,7 +139,7 @@ def _run_wsgi(config: Config, app, worker: Worker, sock, stop, exclusive, ready,
                 rem = drain_end - time.monotonic()
                 if rem <= 0:
                     break
-                worker.select(min(rem, 0.05))
+                select(min(rem, 0.05))
 
         worker.shutdown()
         deadline = time.monotonic() + config.graceful_timeout
@@ -122,7 +147,7 @@ def _run_wsgi(config: Config, app, worker: Worker, sock, stop, exclusive, ready,
             rem = deadline - time.monotonic()
             if rem <= 0:
                 break
-            worker.select(min(rem, 0.05))
+            select(min(rem, 0.05))
         return 0
     finally:
         for sig, prev in prev_signals.items():
@@ -130,7 +155,26 @@ def _run_wsgi(config: Config, app, worker: Worker, sock, stop, exclusive, ready,
                 signal.signal(sig, prev)
             except (OSError, ValueError):
                 pass
+        if wake_r is not None:
+            try:
+                signal.set_wakeup_fd(prev_wakeup_fd)
+            except (OSError, ValueError):
+                pass
+            try:
+                worker.unregister(wake_r.fileno())
+            except (OSError, RuntimeError):
+                pass
+            wake_r.close()
+            wake_w.close()
         worker.close()
+
+
+def _drain(sock) -> None:
+    try:
+        while sock.recv(4096):
+            pass
+    except (BlockingIOError, InterruptedError, OSError):
+        pass
 
 
 def _watch(stop, loop, stopping: asyncio.Event) -> None:

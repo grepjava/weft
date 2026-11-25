@@ -192,3 +192,53 @@ def test_asgi_pathsend(tmp_path):
         assert r.status_code == 200
         assert r.content == payload
         assert int(r.headers['content-length']) == len(payload)
+
+
+def test_asgi_pathsend_owns_framing(tmp_path):
+    from tests.test_http import raw
+
+    target = tmp_path / 'sample.txt'
+    payload = b'0123456789' * 50
+    target.write_bytes(payload)
+    errors = []
+
+    async def app(scope, receive, send):
+        path = scope['path']
+        headers = [(b'content-type', b'text/plain')]
+        if path == '/chunked':
+            headers.append((b'transfer-encoding', b'chunked'))
+        elif path == '/wrong-length':
+            headers.append((b'content-length', b'10'))
+        elif path == '/right-length':
+            headers.append((b'content-length', str(len(payload)).encode()))
+        await send({'type': 'http.response.start', 'status': 200, 'headers': headers})
+        if path == '/after-body':
+            await send({'type': 'http.response.body', 'body': b'x', 'more_body': True})
+        try:
+            await send({'type': 'http.response.pathsend', 'path': str(target)})
+        except (RuntimeError, ValueError) as e:
+            errors.append((path, type(e).__name__))
+            raise
+
+    with serve_thread(app, lifespan='off') as url:
+        for path in ('/chunked', '/right-length'):
+            r = httpx.get(url + path)
+            assert r.content == payload
+            assert int(r.headers['content-length']) == len(payload)
+            assert 'transfer-encoding' not in r.headers
+        # Two requests on one connection: the second response must parse,
+        # so the first was framed exactly.
+        out = raw(url, b'GET /chunked HTTP/1.1\r\nhost: x\r\n\r\nGET /right-length HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n')
+        assert out.count(b'HTTP/1.1 200') == 2
+        assert out.endswith(payload)
+        # The app fails after http.response.start; like any such failure
+        # the server drops the connection rather than send a wrong length.
+        with pytest.raises(httpx.RemoteProtocolError):
+            httpx.get(url + '/wrong-length')
+        try:
+            body = httpx.get(url + '/after-body').content
+        except httpx.HTTPError:
+            body = b''  # the started response is cut off
+        assert b'0123456789' not in body
+    assert ('/wrong-length', 'ValueError') in errors
+    assert ('/after-body', 'RuntimeError') in errors

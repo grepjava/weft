@@ -221,14 +221,16 @@ pub async fn serve(
         Ok(c) => c,
         Err(_) => return,
     };
-    let mut shutting_down = false;
+    // On stop, send GOAWAY but keep accepting: requests the client sent
+    // before it saw the GOAWAY still get answered, and `accept` returning
+    // None is what tells us the connection has finished closing.
+    let mut shutting_down = sh.stopping.get();
+    if shutting_down {
+        h2.graceful_shutdown();
+    }
     loop {
-        if shutting_down {
-            let _ = std::future::poll_fn(|cx| h2.poll_closed(cx)).await;
-            break;
-        }
         tokio::select! {
-            _ = sh.stop.notified() => {
+            _ = sh.stop.notified(), if !shutting_down => {
                 h2.graceful_shutdown();
                 shutting_down = true;
             }

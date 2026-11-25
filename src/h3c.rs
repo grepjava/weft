@@ -188,6 +188,12 @@ async fn connection(sh: Rc<Shared>, incoming: quinn::Incoming) {
         }
     };
     loop {
+        // A stop that fired while we were not waiting for it (during the
+        // handshake). Same exit as the stop branch below: `hold_wt` returns
+        // at once when stopping, so there is nothing to hold.
+        if sh.stopping.get() {
+            break;
+        }
         drain_uni(&mut h3, &hub, &sh);
         let ev = tokio::select! {
             ev = poll_h3(&mut h3) => ev,

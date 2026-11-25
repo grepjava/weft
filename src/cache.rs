@@ -565,7 +565,8 @@ fn write_slot(
         s.hash = 0;
         slot.hash_hint.store(0, Ordering::Release);
         slot.target_hint.store(0, Ordering::Release);
-        seq.fetch_add(1, Ordering::Relaxed);
+        // Release: `invalidate` trusts the hints once it sees `seq` even.
+        seq.fetch_add(1, Ordering::Release);
         return;
     }
     pay[..key.len()].copy_from_slice(key);
@@ -576,7 +577,8 @@ fn write_slot(
     s.body_len = body.len() as u32;
     slot.hash_hint.store(hash, Ordering::Release);
     slot.target_hint.store(target, Ordering::Release);
-    seq.fetch_add(1, Ordering::Relaxed);
+    // Release: `invalidate` trusts the hints once it sees `seq` even.
+    seq.fetch_add(1, Ordering::Release);
     crate::metrics::cache_store();
 }
 
@@ -588,7 +590,17 @@ pub fn invalidate(target: u64) {
     for c in classes {
         for i in 0..c.n {
             let slot = unsafe { &*slot_at(t, c, i) };
-            if slot.target_hint.load(Ordering::Acquire) != target {
+            // A writer publishes the hint last, so the hint of a slot being
+            // written may still be the old one: such a slot must be locked
+            // (or, failing that, every copy retired). Writing is the odd
+            // stretch of `seq`; a slot that is merely locked by a reader, or
+            // idle, has a current hint and can be skipped on it. (A writer
+            // that has the lock but not yet bumped `seq` is no different
+            // from one that locks just after this scan: neither saw the
+            // invalidation, as in any version.)
+            let writing = slot.lock.load(Ordering::Acquire) != 0
+                && slot.seq.load(Ordering::Acquire) & 1 == 1;
+            if !writing && slot.target_hint.load(Ordering::Acquire) != target {
                 continue;
             }
             let Some(mut g) = SlotGuard::lock(t, c, i, now) else {
@@ -1024,6 +1036,41 @@ cache-control: max-age=60
         assert!(generation() > before);
         slot.lock.store(0, Ordering::Relaxed);
         assert!(lookup(&k, 0, None).is_none());
+    }
+
+    #[test]
+    fn invalidate_does_not_skip_a_slot_being_written() {
+        let _serial = table();
+        let k = put(b"/being-written", b"old");
+        let slot = slot_of(&k);
+        // A worker part way through writing this target: it holds the lock,
+        // `seq` is odd, and the slot's hints are not published yet.
+        slot.target_hint.store(0, Ordering::Release);
+        slot.seq.fetch_add(1, Ordering::Relaxed);
+        slot.lock
+            .store(lock_token(std::process::id(), now_ms()), Ordering::Relaxed);
+        let before = generation();
+        invalidate(target_hash(b"/being-written"));
+        assert!(generation() > before, "a slot being written must not be skipped on its stale hint");
+        slot.seq.fetch_add(1, Ordering::Relaxed);
+        slot.lock.store(0, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn invalidate_skips_a_slot_a_reader_holds_for_another_target() {
+        let _serial = table();
+        let k = put(b"/read-elsewhere", b"other");
+        let slot = slot_of(&k);
+        // Locked by a reader (even `seq`) for a different target: its hint
+        // is current, so an invalidation of another target leaves the
+        // cache alone instead of timing out on the lock and flushing it.
+        slot.lock
+            .store(lock_token(std::process::id(), now_ms()), Ordering::Relaxed);
+        let before = generation();
+        invalidate(target_hash(b"/unrelated"));
+        assert_eq!(generation(), before);
+        slot.lock.store(0, Ordering::Relaxed);
+        assert_eq!(lookup(&k, 0, None).expect("still cached").body, b"other");
     }
 
     /// A process that has already exited.

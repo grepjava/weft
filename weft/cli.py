@@ -128,16 +128,30 @@ def parser() -> argparse.ArgumentParser:
     return p
 
 
+def _explicit(argv: list[str] | None) -> set[str]:
+    """The destinations the command line actually set, as opposed to the
+    ones argparse filled with their defaults."""
+    q = parser()
+    for action in q._actions:
+        if action.dest not in ('help', 'version'):
+            action.default = argparse.SUPPRESS
+    return set(vars(q.parse_args(argv)))
+
+
 def main(argv: list[str] | None = None) -> int:
     p = parser()
     ns = p.parse_args(argv)
+    explicit = _explicit(argv)
     if ns.no_lifespan:
         ns.lifespan = 'off'
+        explicit.add('lifespan')
     cli_opts = vars(ns)
     config_path = cli_opts.pop('config', None)
     cli_opts.pop('no_lifespan', None)
 
-    defaults = vars(Config(app=''))
+    # Precedence: command line, then WEFT_* variables, then the TOML file,
+    # then the defaults. A flag typed on the command line wins even when its
+    # value happens to equal the default.
     merged: dict = {}
     merged.update(load_toml_config(config_path))
     merged.update(load_env_config())
@@ -145,8 +159,9 @@ def main(argv: list[str] | None = None) -> int:
         if k == 'app':
             if v is not None:
                 merged['app'] = v
-        elif v != defaults.get(k) or k not in merged:
+        elif k in explicit or k not in merged:
             merged[k] = v
+    defaults = vars(Config(app=''))
     if not merged.get('app'):
         p.error('the following arguments are required: app')
     valid = {k: v for k, v in merged.items() if k in defaults}

@@ -65,16 +65,14 @@ pub fn confirm(fds: &[(i64, u32)], out: &mut Vec<u32>) {
 
 /// Blocks until `io` can take more bytes, for at most `ms`. For code that has
 /// to write from inside a synchronous call, where there is no task to park.
+/// It does not touch the GIL: the caller decides whether it is released
+/// (`wsgi::flush_blocking` releases it around this call).
 pub fn wait_writable(io: &tokio::net::TcpStream, ms: i32) -> bool {
     #[cfg(unix)]
     let fd = std::os::fd::AsRawFd::as_raw_fd(io) as i64;
     #[cfg(windows)]
     let fd = std::os::windows::io::AsRawSocket::as_raw_socket(io) as i64;
-    // Release the GIL while blocking in poll/WSAPoll so other Python threads can run.
-    let saved = unsafe { pyo3_ffi::PyEval_SaveThread() };
-    let ok = imp::wait_writable(fd, ms);
-    unsafe { pyo3_ffi::PyEval_RestoreThread(saved) };
-    ok
+    imp::wait_writable(fd, ms)
 }
 
 #[cfg(unix)]

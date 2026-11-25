@@ -692,9 +692,9 @@ unsafe fn start(
             i.v1_0
         };
         py::dict_set(d, i.http_version, PyRef::borrow(ver))?;
-        if (is_h3 || is_h2)
-            && let Some(ext) = &ctx.h3_extensions
-        {
+        // Only HTTP/3 can carry WebTransport; HTTP/1 and HTTP/2 keep the
+        // default extensions from scope_proto.
+        if is_h3 && let Some(ext) = &ctx.h3_extensions {
             py::dict_set(d, i.extensions, ext.clone())?;
         }
         py::dict_set(d, i.method, method_str(req.method.unwrap_or("GET"))?)?;
@@ -1341,12 +1341,32 @@ unsafe fn http_pathsend(
                 "Expected ASGI message 'http.response.start', but got 'http.response.pathsend'",
             ));
         }
-        let stopping = sh.closing();
-        if st.resp.phase == Phase::Head {
-            // `pathsend` streams raw file bytes directly via `SendFile`.
-            st.accepted = crate::compress::Coding::Identity;
-            st.write_head(size as usize, false, ctx, &date, stopping);
+        if st.resp.phase == Phase::Body {
+            drop(st);
+            return Err(py::runtime_error(
+                "Unexpected ASGI message 'http.response.pathsend' after 'http.response.body'",
+            ));
         }
+        // The file is the whole body: its size is the framing, whatever
+        // framing the start message asked for.
+        if let Some(n) = st.resp.info.length
+            && n != size
+        {
+            drop(st);
+            return Err(py::raise(
+                PyExc_ValueError,
+                &format!("{path_str}: content-length {n} does not match the file size {size}"),
+            ));
+        }
+        st.resp.info.length = Some(size);
+        st.resp.info.chunked = false;
+        // The body bypasses the capture the response cache reads from.
+        st.cache_ok = false;
+        st.cache_key = None;
+        let stopping = sh.closing();
+        // `pathsend` streams raw file bytes directly via `SendFile`.
+        st.accepted = crate::compress::Coding::Identity;
+        st.write_head(size as usize, false, ctx, &date, stopping);
         st.resp.phase = Phase::Done;
         let no_body =
             st.head_req || st.resp.status < 200 || st.resp.status == 204 || st.resp.status == 304;

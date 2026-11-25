@@ -803,6 +803,23 @@ pub fn flush(io: &Io, out: &mut BytesMut) -> io::Result<bool> {
     io.flush_tls_only()
 }
 
+/// `flush` for a thread blocked inside a synchronous call: every write is a
+/// real `send()`, since tokio's readiness cache cannot refresh meanwhile.
+pub fn flush_direct(io: &Io, out: &mut BytesMut) -> io::Result<bool> {
+    if !io.flush_tls_direct()? && out.is_empty() {
+        return Ok(false);
+    }
+    while !out.is_empty() {
+        match io.try_write_direct(out) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => out.advance(n),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+            Err(e) => return Err(e),
+        }
+    }
+    io.flush_tls_direct()
+}
+
 /// Finished responses held for the end of the batch before they go out
 /// anyway: holding one costs its client the time the ones after it take.
 const FLUSH_BATCH: usize = 16;

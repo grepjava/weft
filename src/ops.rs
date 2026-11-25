@@ -105,19 +105,19 @@ fn node_addr(v: &[u8]) -> &[u8] {
     }
 }
 
-/// The client a chain of proxies reports: the nearest hop that is not itself
-/// a trusted proxy, or the farthest one if they all are.
-fn pick_client<'a>(t: &Trusted, hops: &[&'a [u8]]) -> Option<&'a [u8]> {
-    for &h in hops.iter().rev() {
+/// Which hop of a chain of proxies is the client: the nearest one that is not
+/// itself a trusted proxy, or the farthest one if they all are.
+fn pick_hop(t: &Trusted, hops: &[&[u8]]) -> Option<usize> {
+    for (i, &h) in hops.iter().enumerate().rev() {
         let trusted = std::str::from_utf8(h)
             .ok()
             .and_then(|s| s.parse::<IpAddr>().ok())
             .is_some_and(|ip| t.contains(ip));
         if !trusted {
-            return Some(h);
+            return Some(i);
         }
     }
-    hops.first().copied()
+    (!hops.is_empty()).then_some(0)
 }
 
 /// What a trusted proxy said about the request.
@@ -144,11 +144,16 @@ fn proto_secure(v: &[u8]) -> Option<bool> {
 
 /// Reads `Forwarded` (RFC 7239), or failing that `X-Forwarded-For` and
 /// `X-Forwarded-Proto`, from a request sent by a trusted proxy.
+///
+/// The scheme is the one reported by the same hop the client address comes
+/// from: the outermost trusted proxy, which saw the client's own connection.
+/// Values to its left were written by the client and are not believed;
+/// values to its right describe hops between proxies.
 pub fn forwarded(t: &Trusted, headers: &[httparse::Header<'_>]) -> Via {
-    let mut fwd_for: Vec<&[u8]> = Vec::new();
-    let mut fwd_proto = None;
+    // Forwarded: one (for, proto) per element, in order.
+    let mut elements: Vec<(Option<&[u8]>, Option<bool>)> = Vec::new();
     let mut xff: Vec<&[u8]> = Vec::new();
-    let mut xfp = None;
+    let mut xfp: Vec<Option<bool>> = Vec::new();
     let mut rfc = false;
     for h in headers {
         let name = h.name.as_bytes();
@@ -156,17 +161,19 @@ pub fn forwarded(t: &Trusted, headers: &[httparse::Header<'_>]) -> Via {
             9 if eq_ci(name, b"forwarded") => {
                 rfc = true;
                 for element in h.value.split(|&c| c == b',') {
+                    let (mut for_, mut proto) = (None, None);
                     for pair in element.split(|&c| c == b';') {
                         let Some(eq) = pair.iter().position(|&c| c == b'=') else {
                             continue;
                         };
                         let (k, v) = (trim(&pair[..eq]), &pair[eq + 1..]);
                         if eq_ci(k, b"for") {
-                            fwd_for.push(node_addr(v));
-                        } else if eq_ci(k, b"proto") && fwd_proto.is_none() {
-                            fwd_proto = proto_secure(v);
+                            for_ = Some(node_addr(v));
+                        } else if eq_ci(k, b"proto") {
+                            proto = proto_secure(v);
                         }
                     }
+                    elements.push((for_, proto));
                 }
             }
             15 if eq_ci(name, b"x-forwarded-for") => {
@@ -177,19 +184,41 @@ pub fn forwarded(t: &Trusted, headers: &[httparse::Header<'_>]) -> Via {
                         .filter(|v| !v.is_empty()),
                 );
             }
-            17 if eq_ci(name, b"x-forwarded-proto") && xfp.is_none() => {
-                xfp = h.value.split(|&c| c == b',').next().and_then(proto_secure);
+            17 if eq_ci(name, b"x-forwarded-proto") => {
+                xfp.extend(
+                    h.value
+                        .split(|&c| c == b',')
+                        .filter(|v| !trim(v).is_empty())
+                        .map(proto_secure),
+                );
             }
             _ => {}
         }
     }
-    let (hops, secure) = if rfc {
-        (fwd_for, fwd_proto)
+    let (client, secure) = if rfc {
+        let with_for: Vec<usize> = (0..elements.len())
+            .filter(|&i| elements[i].0.is_some())
+            .collect();
+        let hops: Vec<&[u8]> = with_for.iter().filter_map(|&i| elements[i].0).collect();
+        match pick_hop(t, &hops) {
+            // Only the chosen hop's own element speaks for the scheme.
+            Some(h) => (Some(hops[h]), elements[with_for[h]].1),
+            // No `for=` at all: a single proxy reporting just the scheme.
+            None => (None, elements.last().and_then(|e| e.1)),
+        }
     } else {
-        (xff, xfp)
+        let picked = pick_hop(t, &xff);
+        let secure = match picked {
+            // Proxies that append to both lists keep them in step.
+            Some(h) if xfp.len() == xff.len() => xfp[h],
+            // Otherwise (a proxy that overwrites the scheme, or no
+            // X-Forwarded-For) the nearest proxy's value: the last.
+            _ => xfp.last().copied().flatten(),
+        };
+        (picked.map(|h| xff[h]), secure)
     };
     Via {
-        client: pick_client(t, &hops).map(|c| String::from_utf8_lossy(c).into_owned()),
+        client: client.map(|c| String::from_utf8_lossy(c).into_owned()),
         secure,
     }
 }
@@ -295,6 +324,8 @@ pub struct LogReq {
 enum LogMsg {
     Write(Vec<u8>),
     SetFile(Option<String>),
+    /// Answered once everything sent before it is written.
+    Sync(std::sync::mpsc::SyncSender<()>),
 }
 
 static LOG_TX: std::sync::OnceLock<std::sync::mpsc::SyncSender<LogMsg>> =
@@ -324,6 +355,13 @@ fn log_tx() -> &'static std::sync::mpsc::SyncSender<LogMsg> {
                             } else {
                                 let _ = std::io::stderr().lock().write_all(&buf);
                             }
+                        }
+                        LogMsg::Sync(done) => {
+                            if let Some(f) = file.as_mut() {
+                                let _ = f.flush();
+                            }
+                            let _ = std::io::stderr().flush();
+                            let _ = done.send(());
                         }
                     }
                 }
@@ -383,12 +421,54 @@ fn flush_into(l: &mut Option<AccessLog>) {
         && !l.buf.is_empty()
     {
         let out = std::mem::replace(&mut l.buf, Vec::with_capacity(LOG_FLUSH_AT));
-        let _ = log_tx().try_send(LogMsg::Write(out));
+        // Blocks only while the writer is 256 buffers behind. Lines used to
+        // be written inline on this thread, so a slow or stalled sink held
+        // the worker up then too; dropping them instead would lose lines
+        // without a trace. Only the exit path (`sync_log`) is bounded.
+        let _ = log_tx().send(LogMsg::Write(out));
     }
 }
 
 pub fn flush_log() {
     LOG.with(|l| flush_into(&mut l.borrow_mut()));
+}
+
+/// Hands over this thread's lines and waits until the writer thread has
+/// written everything queued, so a worker that exits next loses none. The
+/// wait is bounded: a sink that has stopped taking writes must not keep the
+/// worker from exiting.
+pub fn sync_log() {
+    let Some(tx) = LOG_TX.get() else {
+        return;
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let pending = LOG.with(|l| {
+        l.borrow_mut()
+            .as_mut()
+            .filter(|l| !l.buf.is_empty())
+            .map(|l| std::mem::take(&mut l.buf))
+    });
+    let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+    let mut msgs = pending
+        .map(LogMsg::Write)
+        .into_iter()
+        .chain(std::iter::once(LogMsg::Sync(done_tx)));
+    let mut next = msgs.next();
+    while let Some(msg) = next.take() {
+        match tx.try_send(msg) {
+            Ok(()) => next = msgs.next(),
+            Err(std::sync::mpsc::TrySendError::Full(msg)) => {
+                if std::time::Instant::now() >= deadline {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                next = Some(msg);
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return,
+        }
+    }
+    let left = deadline.saturating_duration_since(std::time::Instant::now());
+    let _ = done_rx.recv_timeout(left);
 }
 
 fn push_int(out: &mut Vec<u8>, v: u64) {

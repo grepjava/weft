@@ -306,26 +306,43 @@ def load_toml_config(path: str | None = None) -> dict[str, Any]:
     return {k.replace('-', '_'): v for k, v in data.items()}
 
 
+def _env_value(name: str, annotation: Any, raw: str) -> Any:
+    """Converts a ``WEFT_*`` value to the type ``Config`` declares for it.
+    The annotations are strings here (``from __future__ import annotations``)."""
+    ann = annotation if isinstance(annotation, str) else getattr(annotation, '__name__', str(annotation))
+    parts = [t.strip() for t in ann.split('|')]
+    optional = 'None' in parts
+    kinds = [t for t in parts if t != 'None']
+    kind = kinds[0] if len(kinds) == 1 else 'Any'
+    text = raw.strip()
+    if optional and text.lower() in ('', 'none', 'null'):
+        return None
+    try:
+        if kind == 'bool':
+            low = text.lower()
+            if low in ('1', 'true', 'yes', 'on'):
+                return True
+            if low in ('0', 'false', 'no', 'off', ''):
+                return False
+            raise ValueError(raw)
+        if kind == 'int':
+            return int(text)
+        if kind == 'float':
+            return float(text)
+        if kind.startswith('list'):
+            return [v.strip() for v in raw.split(',') if v.strip()]
+    except ValueError:
+        raise SystemExit(f'WEFT_{name.upper()}: expected {kind}, got {raw!r}') from None
+    return raw
+
+
 def load_env_config() -> dict[str, Any]:
     """Reads ``WEFT_*`` environment variables matching ``Config`` field names."""
     from dataclasses import fields
 
     out: dict[str, Any] = {}
-    defaults = Config(app='')
     for f in fields(Config):
-        key = f'WEFT_{f.name.upper()}'
-        raw = os.environ.get(key)
-        if raw is None:
-            continue
-        cur = getattr(defaults, f.name)
-        if isinstance(cur, bool):
-            out[f.name] = raw.strip().lower() in ('1', 'true', 'yes', 'on')
-        elif isinstance(cur, int):
-            out[f.name] = int(raw)
-        elif isinstance(cur, float):
-            out[f.name] = float(raw)
-        elif isinstance(cur, list):
-            out[f.name] = [s for s in raw.split(',') if s]
-        else:
-            out[f.name] = raw
+        raw = os.environ.get(f'WEFT_{f.name.upper()}')
+        if raw is not None:
+            out[f.name] = _env_value(f.name, f.type, raw)
     return out

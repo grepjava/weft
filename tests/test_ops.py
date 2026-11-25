@@ -41,6 +41,25 @@ def test_forwarded_headers_from_trusted_proxy(ops):
     assert s['scheme'] == 'https'
 
 
+def test_forwarded_proto_comes_from_the_client_hop(ops):
+    # The fixture trusts 127.0.0.1 only. The scheme is read from the same hop
+    # as the client address: the outermost trusted proxy's view.
+    def scheme(**headers):
+        return scope(ops, headers={k.replace('_', '-'): v for k, v in headers.items()})['scheme']
+
+    # One proxy appended to what the client sent: the client's claim loses.
+    assert scheme(X_Forwarded_For='203.0.113.7', X_Forwarded_Proto='https, http') == 'http'
+    assert scheme(X_Forwarded_For='203.0.113.7', X_Forwarded_Proto='http, https') == 'https'
+    assert scheme(X_Forwarded_For='1.1.1.1, 203.0.113.7', X_Forwarded_Proto='https, http') == 'http'
+    # TLS ends at the outer of two proxies; the inner one appends its own hop.
+    assert scheme(X_Forwarded_For='203.0.113.7, 127.0.0.1', X_Forwarded_Proto='https, http') == 'https'
+    # Forwarded: only the chosen hop's own element counts.
+    assert scheme(Forwarded='for=203.0.113.7;proto=https, for=198.51.100.2;proto=http') == 'http'
+    assert scheme(Forwarded='for=203.0.113.7;proto=https, for=127.0.0.1;proto=http') == 'https'
+    assert scheme(Forwarded='for=1.1.1.1;proto=https, for=203.0.113.7') == 'http'
+    assert scheme(Forwarded='proto=https') == 'https'
+
+
 def test_forwarded_chain_skips_trusted_hops(ops):
     s = scope(ops, headers={'X-Forwarded-For': '203.0.113.7, 127.0.0.1'})
     assert s['client'] == ['203.0.113.7', 0]
@@ -276,6 +295,20 @@ def test_access_log_file(tmp_path):
     assert 'GET / 200' in text
 
 
+def test_access_log_keeps_every_line_through_shutdown(tmp_path):
+    # Many lines, then stop at once: none may be dropped or left queued.
+    from tests.apps.basic import app
+
+    log_path = tmp_path / 'access.log'
+    n = 3000
+    with serve_thread(app, access_log_file=str(log_path), log_level='info') as url:
+        with httpx.Client() as c:
+            for i in range(n):
+                assert c.get(f'{url}/?n={i}').status_code == 200
+    lines = [ln for ln in log_path.read_text(encoding='utf-8').splitlines() if 'GET /' in ln]
+    assert len(lines) == n
+
+
 def test_toml_and_env_config(tmp_path, monkeypatch):
     from weft.config import load_env_config, load_toml_config
 
@@ -289,3 +322,49 @@ def test_toml_and_env_config(tmp_path, monkeypatch):
     env = load_env_config()
     assert env['port'] == 9191
     assert env['compress'] is True
+
+
+def test_env_config_types_optional_fields(monkeypatch):
+    from weft.config import load_env_config
+
+    monkeypatch.setenv('WEFT_HSTS', '31536000')
+    monkeypatch.setenv('WEFT_REDIRECT_HTTP', '8080')
+    monkeypatch.setenv('WEFT_RATE_LIMIT_BURST', '5')
+    monkeypatch.setenv('WEFT_REQUEST_TIMEOUT', '7')
+    monkeypatch.setenv('WEFT_STATIC_DIRS', '/a=static, /b=assets')
+    monkeypatch.setenv('WEFT_HEALTH_CHECK_PATH', '/healthz')
+    env = load_env_config()
+    assert env['hsts'] == 31536000
+    assert env['redirect_http'] == 8080
+    assert env['rate_limit_burst'] == 5
+    assert env['request_timeout'] == 7.0 and isinstance(env['request_timeout'], float)
+    assert env['static_dirs'] == ['/a=static', '/b=assets']
+    assert env['health_check_path'] == '/healthz'
+
+    monkeypatch.setenv('WEFT_HSTS', 'none')
+    assert load_env_config()['hsts'] is None
+    monkeypatch.setenv('WEFT_HSTS', 'soon')
+    with pytest.raises(SystemExit, match='WEFT_HSTS'):
+        load_env_config()
+
+
+def test_cli_flag_beats_env_and_toml_even_at_default(tmp_path, monkeypatch):
+    import weft.cli
+    import weft.server
+
+    seen = {}
+    monkeypatch.setattr(weft.server, 'run', lambda config: seen.setdefault('config', config) and 0)
+    cfg = tmp_path / 'weft.toml'
+    cfg.write_text('port = 9090\nhost = "0.0.0.0"\n', encoding='utf-8')
+    monkeypatch.setenv('WEFT_WORKERS', '4')
+    monkeypatch.setenv('WEFT_LIFESPAN', 'on')
+    weft.cli.main(['app:app', '--config', str(cfg), '--workers', '1', '--port', '8000', '--no-lifespan'])
+    c = seen['config']
+    assert c.workers == 1          # typed, equal to the default: still wins over WEFT_WORKERS
+    assert c.port == 8000          # typed, equal to the default: still wins over the TOML file
+    assert c.lifespan == 'off'     # --no-lifespan wins over WEFT_LIFESPAN
+    assert c.host == '0.0.0.0'     # not typed: the TOML file applies
+
+    seen.clear()
+    weft.cli.main(['app:app', '--config', str(cfg)])
+    assert seen['config'].workers == 4 and seen['config'].port == 9090

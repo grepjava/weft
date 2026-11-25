@@ -169,6 +169,23 @@ def test_wt_bidi_echo(wt):
     run(go())
 
 
+def test_wt_send_on_paused_stream(wt):
+    async def go():
+        async with connect('127.0.0.1', wt, configuration=configuration(), create_protocol=Client) as client:
+            session = client.connect_session('/wt-paused-send')
+            await client.await_session(session)
+            bidi = client.open_stream(session, data=b'a', end=False)
+            # More data while the app has the stream paused parks the
+            # server's receive task on the stream's wakeup.
+            await asyncio.sleep(0.2)
+            client._quic.send_stream_data(bidi, b'b', end_stream=False)
+            client.transmit()
+            body = await client.wait_stream(bidi, timeout=5.0)
+            assert body == b'xy'
+
+    run(go())
+
+
 def test_wt_uni_echo(wt):
     async def go():
         async with connect('127.0.0.1', wt, configuration=configuration(), create_protocol=Client) as client:
