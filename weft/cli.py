@@ -4,13 +4,15 @@ import argparse
 import sys
 
 from . import __version__
-from .config import Config
+from .config import Config, load_env_config, load_toml_config
 
 
 def parser() -> argparse.ArgumentParser:
     d = Config(app='')
     p = argparse.ArgumentParser(prog='weft', description='Serve an ASGI or WSGI application.')
-    p.add_argument('app', help='the application, as module:attribute')
+    p.add_argument('app', nargs='?', default=None, help='the application, as module:attribute')
+    p.add_argument('--config', default=None, metavar='PATH',
+                   help='TOML config file (also reads [tool.weft] from pyproject.toml and WEFT_* env vars)')
     p.add_argument('--host', default=d.host)
     p.add_argument('--port', type=int, default=d.port)
     p.add_argument('--unix', '--uds', dest='unix', default=d.unix, help='listen on a unix socket instead')
@@ -73,6 +75,8 @@ def parser() -> argparse.ArgumentParser:
     ops.add_argument('--access-log', action='store_true', help='log one line per request')
     ops.add_argument('--access-log-format', choices=['text', 'json'], default=d.access_log_format,
                      help='json implies --access-log')
+    ops.add_argument('--access-log-file', default=d.access_log_file, metavar='PATH',
+                     help='write access logs to PATH instead of stderr (implies --access-log)')
     ops.add_argument('--request-id', action='store_true',
                      help='an X-Request-ID per request, for the app, the response and the access log')
     ops.add_argument('--trace-context', action='store_true',
@@ -125,12 +129,28 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ns = parser().parse_args(argv)
+    p = parser()
+    ns = p.parse_args(argv)
     if ns.no_lifespan:
         ns.lifespan = 'off'
-    opts = vars(ns)
-    opts.pop('no_lifespan', None)
-    config = Config(**opts)
+    cli_opts = vars(ns)
+    config_path = cli_opts.pop('config', None)
+    cli_opts.pop('no_lifespan', None)
+
+    defaults = vars(Config(app=''))
+    merged: dict = {}
+    merged.update(load_toml_config(config_path))
+    merged.update(load_env_config())
+    for k, v in cli_opts.items():
+        if k == 'app':
+            if v is not None:
+                merged['app'] = v
+        elif v != defaults.get(k) or k not in merged:
+            merged[k] = v
+    if not merged.get('app'):
+        p.error('the following arguments are required: app')
+    valid = {k: v for k, v in merged.items() if k in defaults}
+    config = Config(**valid)
     from .server import run
 
     return run(config)

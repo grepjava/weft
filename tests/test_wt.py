@@ -6,13 +6,14 @@ import pytest
 from tests.conftest import serve_thread
 from tests.test_https import _cert
 
+
 aioquic = pytest.importorskip('aioquic')
 from aioquic.asyncio.client import connect
 from aioquic.asyncio.protocol import QuicConnectionProtocol
-from aioquic.h3.connection import H3_ALPN, H3Connection
+from aioquic.h3.connection import H3_ALPN, H3Connection, encode_uint_var
 from aioquic.h3.events import DatagramReceived, HeadersReceived, WebTransportStreamDataReceived
-from aioquic.h3.connection import encode_uint_var
 from aioquic.quic.configuration import QuicConfiguration
+
 
 CLOSE_WEBTRANSPORT_SESSION = 0x2843
 
@@ -50,7 +51,7 @@ class Client(QuicConnectionProtocol):
 
     def open_stream(self, session_id, unidirectional=False, data=b'', end=True):
         stream_id = self._http.create_webtransport_stream(session_id, is_unidirectional=unidirectional)
-        if not unidirectional:
+        if not unidirectional and hasattr(self._http, '_get_or_create_stream'):
             with self._http._get_or_create_stream(stream_id) as state:
                 state.frame_type = 0x41
                 state.session_id = session_id

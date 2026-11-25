@@ -192,4 +192,8 @@ def test_interim_refused(basic):
 
 def test_extensions_in_scope(basic):
     ext = json.loads(get(basic, '/extensions').split(b'\r\n\r\n', 1)[1])
-    assert ext == {'http.response.informational': {}, 'http.response.early_hint': {}}
+    assert ext == {
+        'http.response.informational': {},
+        'http.response.early_hint': {},
+        'http.response.pathsend': {},
+    }

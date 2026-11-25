@@ -146,9 +146,8 @@ enum H3Ev {
 #[allow(clippy::while_let_loop)]
 async fn connection(sh: Rc<Shared>, incoming: quinn::Incoming) {
     let Some(ctx) = sh.app() else { return };
-    let tcp = sh.conns.borrow().iter().filter(|(_, c)| !c.stream).count();
-    if tcp >= sh.max_conns() {
-        incoming.ignore();
+    if sh.tcp_conns.get() >= sh.max_conns() {
+        incoming.refuse();
         crate::metrics::rejected();
         return;
     }
@@ -212,36 +211,36 @@ async fn connection(sh: Rc<Shared>, incoming: quinn::Incoming) {
             H3Ev::Bidi(bidi) => {
                 let framed = FrameStream::new(BufRecvStream::new(*bidi));
                 let mut resolver = h3.create_resolver(framed);
-                let frame = poll_fn(|cx| resolver.frame_stream.poll_next(cx)).await;
-                match frame {
-                    Ok(Some(Frame::Headers(h))) => {
-                        let sh = sh.clone();
-                        let ctx = ctx.clone();
-                        let hub = hub.clone();
-                        let frame = Ok(Some(Frame::Headers(h)));
-                        tokio::task::spawn_local(async move {
+                let sh = sh.clone();
+                let ctx = ctx.clone();
+                let hub = hub.clone();
+                tokio::task::spawn_local(async move {
+                    let frame = poll_fn(|cx| resolver.frame_stream.poll_next(cx)).await;
+                    match frame {
+                        Ok(Some(Frame::Headers(h))) => {
+                            let frame = Ok(Some(Frame::Headers(h)));
                             if let Ok(resolved) = resolver.accept_with_frame(frame)
                                 && let Ok((req, stream)) = resolved.resolve().await
                             {
                                 request(sh, ctx, req, stream, peer, hub).await;
                             }
-                        });
+                        }
+                        Ok(Some(Frame::WebTransportStream(sid))) => {
+                            let session_id = wt::session_u64(sid);
+                            let stream_id = resolver.frame_stream.id().into_inner();
+                            hub.incoming_bidi(
+                                &sh,
+                                session_id,
+                                stream_id,
+                                resolver.frame_stream.into_inner(),
+                            );
+                        }
+                        _ => {
+                            // Drop malformed, empty, or unexpected bidi streams instead
+                            // of routing them into WebTransport session 0.
+                        }
                     }
-                    Ok(Some(Frame::WebTransportStream(sid))) => {
-                        let session_id = wt::session_u64(sid);
-                        let stream_id = resolver.frame_stream.id().into_inner();
-                        hub.incoming_bidi(
-                            &sh,
-                            session_id,
-                            stream_id,
-                            resolver.frame_stream.into_inner(),
-                        );
-                    }
-                    _ => {
-                        let stream_id = resolver.frame_stream.id().into_inner();
-                        hub.incoming_bidi(&sh, 0, stream_id, resolver.frame_stream.into_inner());
-                    }
-                }
+                });
             }
             H3Ev::Uni => drain_uni(&mut h3, &hub, &sh),
             H3Ev::Done => {
@@ -484,7 +483,8 @@ fn request_meta_h3(ctx: &AppCtx, conn: &Conn, req: &httparse::Request<'_, '_>) -
 
 async fn drive_wt(sh: &Shared, hub: &Hub, session: &Rc<wt::Session>, conn: &Conn) {
     loop {
-        let wait = session.kick.notified();
+        let mut wait = std::pin::pin!(session.kick.notified());
+        wait.as_mut().enable();
         wt::wake_recv(conn);
         if session.gone.get() && !session.accepted.get() {
             let _ = refuse_wt(conn).await;
@@ -501,13 +501,12 @@ async fn drive_wt(sh: &Shared, hub: &Hub, session: &Rc<wt::Session>, conn: &Conn
         wt::wake_recv(conn);
         return;
     }
+    let mut cap_buf = BytesMut::new();
     loop {
-        let wait = session.kick.notified();
-        if session.gone.get() {
-            let _ = close_wt(hub, session, conn).await;
-            wt::wake_recv(conn);
-            return;
-        }
+        let mut wait = std::pin::pin!(session.kick.notified());
+        wait.as_mut().enable();
+        // Flush queued datagrams and stream opens even when `gone` was set
+        // right after the app sent its last messages.
         for dg in session.take_out_datagrams() {
             let mut pkt = Vec::with_capacity(8 + dg.len());
             wt::encode_varint(&mut pkt, wt::session_quarter(session.id));
@@ -519,14 +518,20 @@ async fn drive_wt(sh: &Shared, hub: &Hub, session: &Rc<wt::Session>, conn: &Conn
                 wt::wake_recv(conn);
             }
         }
-        wt::wake_recv(conn);
         if session.gone.get() {
-            continue;
+            // Give spawned send tasks one turn to flush buffered stream bytes
+            // before sending CLOSE_WEBTRANSPORT_SESSION.
+            tokio::task::yield_now().await;
+            let _ = close_wt(hub, session, conn).await;
+            wt::wake_recv(conn);
+            return;
         }
+        wt::wake_recv(conn);
         tokio::select! {
             r = recv_capsule(conn) => {
                 if let Ok(Some(b)) = r {
-                    wt::parse_capsules(&b, |code, reason| {
+                    cap_buf.extend_from_slice(&b);
+                    wt::parse_capsules_buf(&mut cap_buf, |code, reason| {
                         hub.close_peer(sh, session.id, code, reason);
                     });
                 } else {
@@ -687,7 +692,7 @@ async fn drive(
     rbuf: &mut BytesMut,
     body: &mut http::StreamBody<H3Recv>,
 ) {
-    let limit = ctx.request_timeout.unwrap_or(Duration::from_secs(30));
+    let limit = ctx.request_timeout;
     let body_limit = ctx.request_timeout.unwrap_or(Duration::from_secs(86_400));
     loop {
         let (want_body, paused) = {
@@ -758,10 +763,14 @@ async fn drive(
                 wake_http_recv(conn);
                 return;
             }
-        } else if tokio::time::timeout(limit, notified).await.is_err() {
-            conn.st.borrow_mut().disconnected = true;
-            wake_http_recv(conn);
-            return;
+        } else if let Some(limit) = limit {
+            if tokio::time::timeout(limit, notified).await.is_err() {
+                conn.st.borrow_mut().disconnected = true;
+                wake_http_recv(conn);
+                return;
+            }
+        } else {
+            notified.await;
         }
     }
 }
@@ -775,7 +784,7 @@ pub async fn flush_h3(conn: &Conn) -> io::Result<bool> {
         return Ok(true);
     }
     loop {
-        let (head, body, eos, interim) = {
+        let (parsed_head, body, eos, interim) = {
             if tx.stream.is_none() {
                 return Ok(true);
             }
@@ -785,13 +794,13 @@ pub async fn flush_h3(conn: &Conn) -> io::Result<bool> {
                     return Ok(true);
                 };
                 let head = st.out.split_to(end);
-                let (status, _) = parse_h1_head(&head);
+                let (status, headers) = parse_h1_head(&head);
                 if (100..200).contains(&status) {
-                    (Some(head), Bytes::new(), false, true)
+                    (Some((status, headers)), Bytes::new(), false, true)
                 } else {
                     let body = st.out.split().freeze();
                     let eos = st.resp.phase == Phase::Done && st.send_file.is_none();
-                    (Some(head), body, eos, false)
+                    (Some((status, headers)), body, eos, false)
                 }
             } else {
                 let body = st.out.split().freeze();
@@ -799,8 +808,7 @@ pub async fn flush_h3(conn: &Conn) -> io::Result<bool> {
                 (None, body, eos, false)
             }
         };
-        if let Some(head) = head {
-            let (status, headers) = parse_h1_head(&head);
+        if let Some((status, headers)) = parsed_head {
             let mut res = Response::new(());
             *res.status_mut() =
                 StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -864,10 +872,12 @@ fn alloc_parent(sh: &Shared, peer: SocketAddr) -> Rc<Conn> {
         waker: RefCell::new(None),
     });
     entry.insert(conn.clone());
+    sh.tcp_conns.set(sh.tcp_conns.get() + 1);
     conn
 }
 
 fn teardown_parent(sh: &Shared, conn: &Conn) {
+    sh.tcp_conns.set(sh.tcp_conns.get().saturating_sub(1));
     crate::metrics::closed();
     sh.conns.borrow_mut().try_remove(conn.slot as usize);
 }

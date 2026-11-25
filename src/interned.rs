@@ -69,6 +69,7 @@ interned! {
     websocket_http_response = c"websocket.http.response",
     http_response_informational = c"http.response.informational",
     http_response_early_hint = c"http.response.early_hint",
+    http_response_pathsend = c"http.response.pathsend",
     links = c"links",
     text = c"text",
     bytes_ = c"bytes",
@@ -133,6 +134,8 @@ interned! {
     // method and keyword names
     close = c"close",
     loop_ = c"loop",
+    eager_start = c"eager_start",
+    done = c"done",
     set_result = c"set_result",
     exception = c"exception",
     add_done_callback = c"add_done_callback",

@@ -348,7 +348,7 @@ fn has_token(v: &[u8], want: &[u8]) -> bool {
 
 /// Incremental compressor. Each `push` returns bytes ready for the wire.
 pub struct Encoder {
-    inner: Inner,
+    inner: Option<Inner>,
 }
 
 enum Inner {
@@ -369,28 +369,44 @@ impl Encoder {
                 Vec::with_capacity(4096),
                 4096,
                 4,
-                22,
+                18,
             ))),
             Coding::Zstd => {
                 let enc = zstd::stream::write::Encoder::new(Vec::with_capacity(4096), 1).ok()?;
                 Inner::Zstd(enc)
             }
         };
-        Some(Encoder { inner })
+        Some(Encoder { inner: Some(inner) })
     }
 
     pub fn push(&mut self, data: &[u8], finish: bool) -> Vec<u8> {
-        match &mut self.inner {
+        if finish {
+            let Some(inner) = self.inner.take() else {
+                return Vec::new();
+            };
+            return match inner {
+                Inner::Gzip(mut z) => {
+                    let _ = z.write_all(data);
+                    z.finish().unwrap_or_default()
+                }
+                Inner::Br(mut z) => {
+                    let _ = z.write_all(data);
+                    z.into_inner()
+                }
+                Inner::Zstd(mut z) => {
+                    let _ = z.write_all(data);
+                    z.finish().unwrap_or_default()
+                }
+            };
+        }
+        let Some(inner) = self.inner.as_mut() else {
+            return Vec::new();
+        };
+        match inner {
             Inner::Gzip(z) => {
                 let _ = z.write_all(data);
-                if finish {
-                    std::mem::replace(z, GzEncoder::new(Vec::new(), Compression::fast()))
-                        .finish()
-                        .unwrap_or_default()
-                } else {
-                    let _ = z.flush();
-                    std::mem::take(z.get_mut())
-                }
+                let _ = z.flush();
+                std::mem::take(z.get_mut())
             }
             Inner::Br(z) => {
                 let _ = z.write_all(data);
@@ -399,17 +415,8 @@ impl Encoder {
             }
             Inner::Zstd(z) => {
                 let _ = z.write_all(data);
-                if finish {
-                    std::mem::replace(
-                        z,
-                        zstd::stream::write::Encoder::new(Vec::new(), 1).expect("zstd"),
-                    )
-                    .finish()
-                    .unwrap_or_default()
-                } else {
-                    let _ = z.flush();
-                    std::mem::take(z.get_mut())
-                }
+                let _ = z.flush();
+                std::mem::take(z.get_mut())
             }
         }
     }
@@ -523,5 +530,25 @@ mod tests {
         let mut out = String::new();
         std::io::Read::read_to_string(&mut z, &mut out).unwrap();
         assert_eq!(out, "hello world");
+    }
+
+    #[test]
+    fn br_round_trip() {
+        let mut e = Encoder::new(Coding::Br).unwrap();
+        let a = e.push(b"hello ", false);
+        let b = e.push(b"world", true);
+        let mut z = brotli::Decompressor::new(std::io::Cursor::new([a, b].concat()), 4096);
+        let mut out = String::new();
+        std::io::Read::read_to_string(&mut z, &mut out).unwrap();
+        assert_eq!(out, "hello world");
+    }
+
+    #[test]
+    fn zstd_round_trip() {
+        let mut e = Encoder::new(Coding::Zstd).unwrap();
+        let a = e.push(b"hello ", false);
+        let b = e.push(b"world", true);
+        let out = zstd::decode_all(std::io::Cursor::new([a, b].concat())).unwrap();
+        assert_eq!(out, b"hello world");
     }
 }

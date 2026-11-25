@@ -147,6 +147,14 @@ fn wait_queued(lsock: SOCKET, stop: &Stop) -> bool {
         if n < 0 || fds[1].revents != 0 {
             return false;
         }
+        if fds[0].revents
+            & (windows_sys::Win32::Networking::WinSock::POLLERR
+                | windows_sys::Win32::Networking::WinSock::POLLHUP
+                | windows_sys::Win32::Networking::WinSock::POLLNVAL)
+            != 0
+        {
+            return false;
+        }
         if fds[0].revents != 0 {
             return true;
         }

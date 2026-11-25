@@ -97,6 +97,8 @@ class Config:
     access_log: bool = False
     #: ``text`` or ``json``
     access_log_format: str = 'text'
+    #: write access log lines to this file instead of stderr
+    access_log_file: str | None = None
     #: listen on this unix socket instead of ``host:port``
     unix: str | None = None
     #: ``N/s``, ``N/m`` or ``N/h``; ``None`` is off
@@ -149,7 +151,17 @@ class Config:
         return self.workers if self.workers > 0 else (os.cpu_count() or 1)
 
     def prepare(self) -> None:
-        """Activates ``--venv`` / ``VIRTUAL_ENV`` before the application is imported."""
+        """Validates options and activates ``--venv`` / ``VIRTUAL_ENV`` before importing the app."""
+        if not (0 <= self.port <= 65535):
+            raise SystemExit(f'--port must be 0..65535, got {self.port}')
+        if self.workers < 0:
+            raise SystemExit(f'--workers must be >= 0, got {self.workers}')
+        if self.max_connections < 1:
+            raise SystemExit(f'--max-connections must be >= 1, got {self.max_connections}')
+        if self.backlog < 1:
+            raise SystemExit(f'--backlog must be >= 1, got {self.backlog}')
+        if self.graceful_timeout < 0 or self.keep_alive < 0 or self.header_timeout < 0:
+            raise SystemExit('timeouts must be >= 0')
         if len(self.tls_certs) != len(self.tls_keys):
             raise SystemExit('--tls-cert and --tls-key go together, one key per certificate')
         if self.hsts is not None and not self.tls_certs:
@@ -201,9 +213,9 @@ class Config:
         return detect(app)
 
     def access_log_mode(self) -> str | None:
-        """``'text'``, ``'json'``, or ``None``: JSON implies the log, and the
-        log is info level, so a quieter level turns it off."""
-        on = self.access_log or self.access_log_format == 'json'
+        """``'text'``, ``'json'``, or ``None``: JSON or a log file implies the log,
+        and the log is info level, so a quieter level turns it off."""
+        on = self.access_log or self.access_log_format == 'json' or bool(self.access_log_file)
         if not on or self.log_level in ('warning', 'error', 'critical'):
             return None
         return self.access_log_format
@@ -219,6 +231,7 @@ class Config:
             'request_start_header': self.request_start_header,
             'health_check_path': self.health_check_path,
             'access_log': self.access_log_mode(),
+            'access_log_file': self.access_log_file,
             'rate_limit': self.rate_limit,
             'rate_limit_burst': self.rate_limit_burst,
             'rate_limit_map': self.rate_limit_map,
@@ -264,3 +277,55 @@ class Config:
             'metrics_listen': self.metrics_listen,
             'metrics_workers': self.metrics_workers,
         }
+
+
+def load_toml_config(path: str | None = None) -> dict[str, Any]:
+    """Loads configuration values from a TOML file (or ``[tool.weft]`` in
+    ``pyproject.toml`` when ``path`` is ``None`` and the file exists)."""
+    if sys.version_info < (3, 11):
+        if path is not None:
+            raise SystemExit('--config requires Python 3.11+ (stdlib tomllib)')
+        return {}
+    import tomllib
+
+    if path is not None:
+        with open(path, 'rb') as f:
+            data = tomllib.load(f)
+        if 'tool' in data and isinstance(data['tool'], dict) and 'weft' in data['tool']:
+            data = data['tool']['weft']
+        elif 'weft' in data and isinstance(data['weft'], dict):
+            data = data['weft']
+    else:
+        if not os.path.isfile('pyproject.toml'):
+            return {}
+        with open('pyproject.toml', 'rb') as f:
+            data = tomllib.load(f)
+        data = data.get('tool', {}).get('weft', {})
+    if not isinstance(data, dict):
+        return {}
+    return {k.replace('-', '_'): v for k, v in data.items()}
+
+
+def load_env_config() -> dict[str, Any]:
+    """Reads ``WEFT_*`` environment variables matching ``Config`` field names."""
+    from dataclasses import fields
+
+    out: dict[str, Any] = {}
+    defaults = Config(app='')
+    for f in fields(Config):
+        key = f'WEFT_{f.name.upper()}'
+        raw = os.environ.get(key)
+        if raw is None:
+            continue
+        cur = getattr(defaults, f.name)
+        if isinstance(cur, bool):
+            out[f.name] = raw.strip().lower() in ('1', 'true', 'yes', 'on')
+        elif isinstance(cur, int):
+            out[f.name] = int(raw)
+        elif isinstance(cur, float):
+            out[f.name] = float(raw)
+        elif isinstance(cur, list):
+            out[f.name] = [s for s in raw.split(',') if s]
+        else:
+            out[f.name] = raw
+    return out

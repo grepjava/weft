@@ -259,3 +259,33 @@ def test_rate_limit_keep_alive():
                        + b'connection: close\r\n\r\n')
         assert out.count(b'HTTP/1.1 200') == 1
         assert b'429 Too Many Requests' in out
+
+
+def test_access_log_file(tmp_path):
+    from tests.apps.basic import app
+
+    log_path = tmp_path / 'access.log'
+    with serve_thread(app, access_log_file=str(log_path), log_level='info') as url:
+        assert httpx.get(url + '/').status_code == 200
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if log_path.exists() and log_path.read_text(encoding='utf-8').strip():
+                break
+            time.sleep(0.05)
+    text = log_path.read_text(encoding='utf-8')
+    assert 'GET / 200' in text
+
+
+def test_toml_and_env_config(tmp_path, monkeypatch):
+    from weft.config import load_env_config, load_toml_config
+
+    cfg = tmp_path / 'weft.toml'
+    cfg.write_text('host = "0.0.0.0"\nport = 9090\nworkers = 4\ncompress = true\n', encoding='utf-8')
+    loaded = load_toml_config(str(cfg))
+    assert loaded == {'host': '0.0.0.0', 'port': 9090, 'workers': 4, 'compress': True}
+
+    monkeypatch.setenv('WEFT_PORT', '9191')
+    monkeypatch.setenv('WEFT_COMPRESS', 'true')
+    env = load_env_config()
+    assert env['port'] == 9191
+    assert env['compress'] is True

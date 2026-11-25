@@ -163,8 +163,14 @@ pub fn dispatch(sh: &Shared, ctx: &Rc<AppCtx>, conn: &Rc<Conn>, rbuf: &mut Bytes
     if (http11 && hosts == 0) || hosts > 1 {
         return Parsed::Reject(400);
     }
-    let method_owned = req.method.unwrap_or("GET").to_ascii_uppercase();
-    let method = method_owned.as_str();
+    let raw_method = req.method.unwrap_or("GET");
+    let method_owned: std::borrow::Cow<'_, str> =
+        if raw_method.bytes().any(|b| b.is_ascii_lowercase()) {
+            std::borrow::Cow::Owned(raw_method.to_ascii_uppercase())
+        } else {
+            std::borrow::Cow::Borrowed(raw_method)
+        };
+    let method = method_owned.as_ref();
     if let Some(path) = &ctx.health
         && matches!(method, "GET" | "HEAD")
         && !te
@@ -190,7 +196,9 @@ pub fn dispatch(sh: &Shared, ctx: &Rc<AppCtx>, conn: &Rc<Conn>, rbuf: &mut Bytes
             st.out.extend_from_slice(b"\r\n");
         }
         st.out.extend_from_slice(b"\r\n");
-        st.started = tokio::time::Instant::now();
+        if crate::metrics::enabled() {
+            st.started = tokio::time::Instant::now();
+        }
         st.log_response(if draining { 503 } else { 200 });
         return Parsed::Answered(keep);
     }
@@ -204,7 +212,11 @@ pub fn dispatch(sh: &Shared, ctx: &Rc<AppCtx>, conn: &Rc<Conn>, rbuf: &mut Bytes
         let key = meta
             .client
             .as_deref()
-            .map(|c| crate::limit::name_key(c.as_bytes()))
+            .map(|c| {
+                c.parse::<std::net::IpAddr>()
+                    .map(crate::limit::ip_key)
+                    .unwrap_or_else(|_| crate::limit::name_key(c.as_bytes()))
+            })
             .or_else(|| (!conn.unix).then(|| crate::limit::ip_key(conn.peer.ip())));
         if let Some(wait) = crate::limit::wait(rate, key)
             && wait > 0
@@ -223,7 +235,19 @@ pub fn dispatch(sh: &Shared, ctx: &Rc<AppCtx>, conn: &Rc<Conn>, rbuf: &mut Bytes
             } else {
                 Vec::new()
             };
-            let log = crate::ops::log_enabled().then(|| log_req(ctx, &req, method, http11));
+            let proto = {
+                let st = conn.st.borrow();
+                if st.h3 {
+                    3
+                } else if st.h2 {
+                    2
+                } else if http11 {
+                    1
+                } else {
+                    0
+                }
+            };
+            let log = crate::ops::log_enabled().then(|| log_req(ctx, &req, method, proto));
             let head_only = method == "HEAD";
             rbuf.advance(n);
             let mut st = conn.st.borrow_mut();
@@ -244,7 +268,7 @@ pub fn dispatch(sh: &Shared, ctx: &Rc<AppCtx>, conn: &Rc<Conn>, rbuf: &mut Bytes
         && matches!(method, "GET" | "HEAD")
         && !te
         && length.unwrap_or(0) == 0
-        && let Some(opened) =
+        && let Some(mut opened) =
             crate::staticf::open(&ctx.static_dirs, target, req.headers, ctx.compress_static)
     {
         let (status, _) = opened.precondition(req.headers);
@@ -261,7 +285,19 @@ pub fn dispatch(sh: &Shared, ctx: &Rc<AppCtx>, conn: &Rc<Conn>, rbuf: &mut Bytes
         } else {
             Vec::new()
         };
-        let log = crate::ops::log_enabled().then(|| log_req(ctx, &req, method, http11));
+        let proto = {
+            let st = conn.st.borrow();
+            if st.h3 {
+                3
+            } else if st.h2 {
+                2
+            } else if http11 {
+                1
+            } else {
+                0
+            }
+        };
+        let log = crate::ops::log_enabled().then(|| log_req(ctx, &req, method, proto));
         let head_only = method == "HEAD";
         rbuf.advance(n);
         let mut st = conn.st.borrow_mut();
@@ -334,8 +370,7 @@ pub fn dispatch(sh: &Shared, ctx: &Rc<AppCtx>, conn: &Rc<Conn>, rbuf: &mut Bytes
     if let Some((Some(key), _, variant, true)) = cache_prep.as_ref()
         && !chunked
         && length.unwrap_or(0) == 0
-        && let Some(mut hit) =
-            crate::cache::lookup(key, 0, None).or_else(|| crate::cache::lookup(key, *variant, None))
+        && let Some(mut hit) = crate::cache::lookup_any(key, *variant, None)
     {
         let etag = crate::cache::stored_etag(&hit.head);
         if !etag.is_empty() && crate::cache::inm_matches(req.headers, &etag) {
@@ -354,7 +389,19 @@ pub fn dispatch(sh: &Shared, ctx: &Rc<AppCtx>, conn: &Rc<Conn>, rbuf: &mut Bytes
         } else {
             Vec::new()
         };
-        let log = crate::ops::log_enabled().then(|| log_req(ctx, &req, method, http11));
+        let proto = {
+            let st = conn.st.borrow();
+            if st.h3 {
+                3
+            } else if st.h2 {
+                2
+            } else if http11 {
+                1
+            } else {
+                0
+            }
+        };
+        let log = crate::ops::log_enabled().then(|| log_req(ctx, &req, method, proto));
         let head_only = method == "HEAD" || hit.status == 304;
         rbuf.advance(n);
         let mut st = conn.st.borrow_mut();
@@ -375,6 +422,10 @@ pub fn dispatch(sh: &Shared, ctx: &Rc<AppCtx>, conn: &Rc<Conn>, rbuf: &mut Bytes
     if ctx.wsgi.is_some() && upgrade && to_websocket {
         return Parsed::Reject(501);
     }
+    let is_h2_or_h3 = {
+        let st = conn.st.borrow();
+        st.h2 || st.h3
+    };
     if upgrade
         && to_websocket
         && http11
@@ -382,7 +433,7 @@ pub fn dispatch(sh: &Shared, ctx: &Rc<AppCtx>, conn: &Rc<Conn>, rbuf: &mut Bytes
         && ws_version
         && let Some(key) = ws_key.filter(|k| !k.is_empty())
     {
-        if !ctx.ws.enabled {
+        if is_h2_or_h3 || !ctx.ws.enabled {
             return Parsed::Reject(501);
         }
         let started = unsafe { crate::ws::start(sh, ctx, conn, &req, key, &meta) };
@@ -427,7 +478,16 @@ pub fn dispatch(sh: &Shared, ctx: &Rc<AppCtx>, conn: &Rc<Conn>, rbuf: &mut Bytes
             };
         }
         if crate::ops::log_enabled() {
-            st.log = Some(log_req(ctx, &req, method, http11));
+            let proto = if st.h3 {
+                3
+            } else if st.h2 {
+                2
+            } else if http11 {
+                1
+            } else {
+                0
+            };
+            st.log = Some(log_req(ctx, &req, method, proto));
         }
         st.seq
     };
@@ -445,9 +505,25 @@ pub fn dispatch(sh: &Shared, ctx: &Rc<AppCtx>, conn: &Rc<Conn>, rbuf: &mut Bytes
     }
     let started = unsafe { start(sh, ctx, conn, &req, http11, seq, &meta) };
     rbuf.advance(n);
-    if started.is_err() {
-        unsafe { py::report_exception(ctx.report.as_ref().map(PyRef::ptr)) };
-        conn.st.borrow_mut().write_error(500);
+    match started {
+        Ok(true) => {
+            let st = conn.st.borrow();
+            if !st.disconnected
+                && !st.h2
+                && !st.h3
+                && st.resp.phase == Phase::Done
+                && st.send_file.is_none()
+                && st.body.done
+            {
+                let keep = !st.resp.close && !sh.closing();
+                return Parsed::Answered(keep);
+            }
+        }
+        Ok(false) => {}
+        Err(_) => {
+            unsafe { py::report_exception(ctx.report.as_ref().map(PyRef::ptr)) };
+            conn.st.borrow_mut().write_error(500);
+        }
     }
     Parsed::Dispatched
 }
@@ -499,7 +575,7 @@ fn log_req(
     ctx: &AppCtx,
     req: &httparse::Request<'_, '_>,
     method: &str,
-    http11: bool,
+    proto: u8,
 ) -> Box<crate::ops::LogReq> {
     let target = req.path.unwrap_or("/").as_bytes();
     let mut line = Vec::with_capacity(method.len() + 1 + target.len());
@@ -522,7 +598,7 @@ fn log_req(
         started: std::time::Instant::now(),
         line,
         method_len: method.len(),
-        http11,
+        proto,
         trace,
     })
 }
@@ -597,14 +673,18 @@ unsafe fn start(
     http11: bool,
     seq: u32,
     meta: &Meta,
-) -> PResult<()> {
+) -> PResult<bool> {
     let i = s();
     unsafe {
         let scope = PyRef::own(PyDict_Copy(ctx.scope_proto.ptr()))?;
         let d = scope.ptr();
-        let ver = if conn.st.borrow().h3 {
+        let (is_h2, is_h3) = {
+            let st = conn.st.borrow();
+            (st.h2, st.h3)
+        };
+        let ver = if is_h3 {
             i.v3
-        } else if conn.st.borrow().h2 {
+        } else if is_h2 {
             i.v2
         } else if http11 {
             i.v1_1
@@ -612,7 +692,7 @@ unsafe fn start(
             i.v1_0
         };
         py::dict_set(d, i.http_version, PyRef::borrow(ver))?;
-        if conn.st.borrow().h3
+        if (is_h3 || is_h2)
             && let Some(ext) = &ctx.h3_extensions
         {
             py::dict_set(d, i.extensions, ext.clone())?;
@@ -624,13 +704,13 @@ unsafe fn start(
                 d,
                 i.scheme,
                 if secure {
-                    py::str_ascii(b"https")?
+                    PyRef::borrow(i.https)
                 } else {
                     PyRef::borrow(i.http)
                 },
             )?;
         }
-        launch(sh, ctx, conn, d, receive_vc, send_vc, seq)
+        launch(sh, ctx, conn, d, receive_vc, send_vc, seq, true)
     }
 }
 
@@ -711,6 +791,9 @@ pub unsafe fn fill_request(
 }
 
 /// Calls the application with `scope` and wraps the coroutine in a task.
+/// When `eager` is true (HTTP on Python 3.12+), runs the task eagerly and
+/// returns `Ok(true)` if it finished inline without suspending.
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn launch(
     sh: &Shared,
     ctx: &AppCtx,
@@ -719,24 +802,53 @@ pub unsafe fn launch(
     receive_vc: vectorcallfunc,
     send_vc: vectorcallfunc,
     seq: u32,
-) -> PResult<()> {
+    eager: bool,
+) -> PResult<bool> {
     let i = s();
     unsafe {
         let t = types();
         let receive = types::chan(&t.receive, receive_vc, conn.slot, conn.generation, seq)?;
         let send = types::chan(&t.send, send_vc, conn.slot, conn.generation, seq)?;
         let coro = py::call(ctx.app.ptr(), &[d, receive.ptr(), send.ptr()])?;
-        let task = py::call_kw(
-            ctx.task_type.ptr(),
-            &[coro.ptr(), ctx.loop_.ptr()],
-            1,
-            ctx.kw_loop.ptr(),
-        )?;
+        #[cfg(Py_3_12)]
+        let task = if eager {
+            py::call_kw(
+                ctx.task_type.ptr(),
+                &[coro.ptr(), ctx.loop_.ptr(), Py_True()],
+                1,
+                ctx.kw_task.ptr(),
+            )?
+        } else {
+            py::call_kw(
+                ctx.task_type.ptr(),
+                &[coro.ptr(), ctx.loop_.ptr()],
+                1,
+                ctx.kw_loop.ptr(),
+            )?
+        };
+        #[cfg(not(Py_3_12))]
+        let task = {
+            let _ = eager;
+            py::call_kw(
+                ctx.task_type.ptr(),
+                &[coro.ptr(), ctx.loop_.ptr()],
+                1,
+                ctx.kw_loop.ptr(),
+            )?
+        };
+        #[cfg(Py_3_12)]
+        if eager {
+            let is_done = py::call_method(i.done, &[task.ptr()])?;
+            if py::truthy(is_done.ptr())? {
+                finish_task_for(sh, ctx, conn.slot, conn.generation, seq, task.ptr(), true);
+                return Ok(true);
+            }
+        }
         let done = types::chan(&t.done, done_vc, conn.slot, conn.generation, seq)?;
         py::call_method(i.add_done_callback, &[task.ptr(), done.ptr()])?;
     }
     sh.py_scheduled();
-    Ok(())
+    Ok(false)
 }
 
 // --- messages ------------------------------------------------------------------
@@ -890,14 +1002,41 @@ pub unsafe fn worker<'a>() -> PResult<(&'a Shared, Rc<AppCtx>)> {
     Ok((sh, ctx))
 }
 
+const TOKEN_CHAR: [bool; 256] = {
+    let mut t = [false; 256];
+    let mut b = 0usize;
+    while b < 256 {
+        let c = b as u8;
+        t[b] = c.is_ascii_alphanumeric()
+            || matches!(
+                c,
+                b'!' | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'|'
+                    | b'~'
+            );
+        b += 1;
+    }
+    t
+};
+
 pub fn valid_name(n: &[u8]) -> bool {
-    !n.is_empty()
-        && n.iter()
-            .all(|&c| c.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&c))
+    !n.is_empty() && n.iter().all(|&c| TOKEN_CHAR[c as usize])
 }
 
 pub fn valid_value(v: &[u8]) -> bool {
-    !v.iter().any(|&c| c == b'\r' || c == b'\n' || c == 0)
+    v.iter()
+        .all(|&c| c == b'\t' || (0x20..=0x7e).contains(&c) || c >= 0x80)
 }
 
 /// Appends `name: value\r\n` lines for an ASGI header iterable, noting the
@@ -978,9 +1117,10 @@ pub unsafe fn encode_headers(
                 17 if eq_ci(n, b"transfer-encoding") => {
                     info.chunked = tokens(v).any(|t| eq_ci(t, b"chunked"));
                     if info.chunked {
-                        // Framing is ours to write, including this header.
+                        // Framing is ours to write; State::write_head emits
+                        // `transfer-encoding: chunked` only when HTTP/1.1 framing
+                        // actually uses it.
                         out.truncate(start);
-                        out.extend_from_slice(b"transfer-encoding: chunked\r\n");
                         continue;
                     }
                 }
@@ -1005,6 +1145,7 @@ unsafe fn send(c: &ChanObj, msg: *mut PyObject) -> PResult<PyRef> {
         match ty {
             b"http.response.start" => http_start(&ctx, c, msg, conn.as_deref()),
             b"http.response.body" => http_body(sh, &ctx, c, msg, conn.as_deref()),
+            b"http.response.pathsend" => http_pathsend(sh, &ctx, c, msg, conn.as_deref()),
             b"http.response.informational" => {
                 informational(sh, &ctx, c, msg, conn.as_deref(), false)
             }
@@ -1102,7 +1243,11 @@ pub unsafe fn http_body(
         let Some(conn) = conn else {
             return Ok(ctx.done.clone());
         };
-        let date = sh.date();
+        let date = if ctx.date_header {
+            sh.date()
+        } else {
+            [0u8; 29]
+        };
         let mut st = conn.st.borrow_mut();
         if st.disconnected || (st.rejected && st.seq == c.seq) {
             return Ok(ctx.done.clone());
@@ -1133,6 +1278,93 @@ pub unsafe fn http_body(
         if complete || queued > 0 {
             conn.notify(sh);
         }
+        backpressure(sh, ctx, conn, queued)
+    }
+}
+
+/// ASGI `http.response.pathsend` extension: streams a file directly from disk
+/// using `staticf::SendFile` without reading the file into Python memory.
+unsafe fn http_pathsend(
+    sh: &Shared,
+    ctx: &AppCtx,
+    c: &ChanObj,
+    msg: *mut PyObject,
+    conn: Option<&Conn>,
+) -> PResult<PyRef> {
+    unsafe {
+        let i = s();
+        let path_obj = py::dict_get(msg, i.path)?
+            .ok_or_else(|| py::raise(PyExc_KeyError, "'http.response.pathsend' has no 'path'"))?;
+        let fspath = PyRef::own(PyOS_FSPath(path_obj.ptr()))?;
+        let path_str = if PyUnicode_Check(fspath.ptr()) != 0 {
+            std::str::from_utf8(py::str_view(fspath.ptr())?)
+                .map_err(|_| py::raise(PyExc_ValueError, "path must be valid UTF-8"))?
+                .to_owned()
+        } else {
+            return Err(py::type_error(
+                "'http.response.pathsend' path must be str or PathLike",
+            ));
+        };
+        let file = std::fs::File::open(&path_str)
+            .map_err(|e| py::raise(PyExc_OSError, &format!("{path_str}: {e}")))?;
+        let meta = file
+            .metadata()
+            .map_err(|e| py::raise(PyExc_OSError, &format!("{path_str}: {e}")))?;
+        if !meta.is_file() {
+            return Err(py::raise(
+                PyExc_OSError,
+                &format!("{path_str}: not a regular file"),
+            ));
+        }
+        let size = meta.len();
+        let Some(conn) = conn else {
+            return Ok(ctx.done.clone());
+        };
+        let date = if ctx.date_header {
+            sh.date()
+        } else {
+            [0u8; 29]
+        };
+        let mut st = conn.st.borrow_mut();
+        if st.disconnected || (st.rejected && st.seq == c.seq) {
+            return Ok(ctx.done.clone());
+        }
+        if st.seq != c.seq || st.resp.phase == Phase::Done {
+            drop(st);
+            return Err(py::runtime_error(
+                "Unexpected ASGI message 'http.response.pathsend': the response has already completed",
+            ));
+        }
+        if st.resp.phase == Phase::Idle {
+            drop(st);
+            return Err(py::runtime_error(
+                "Expected ASGI message 'http.response.start', but got 'http.response.pathsend'",
+            ));
+        }
+        let stopping = sh.closing();
+        if st.resp.phase == Phase::Head {
+            // `pathsend` streams raw file bytes directly via `SendFile`.
+            st.accepted = crate::compress::Coding::Identity;
+            st.write_head(size as usize, false, ctx, &date, stopping);
+        }
+        st.resp.phase = Phase::Done;
+        let no_body =
+            st.head_req || st.resp.status < 200 || st.resp.status == 204 || st.resp.status == 304;
+        if !no_body && size > 0 {
+            st.send_file = Some(Box::new(crate::staticf::SendFile {
+                file,
+                remaining: size,
+            }));
+            crate::staticf::pump(&mut st);
+        }
+        if crate::http::flush_st(conn, &mut st).is_err() {
+            st.disconnected = true;
+            st.out.clear();
+            st.send_file = None;
+        }
+        let queued = st.out.len();
+        drop(st);
+        conn.notify(sh);
         backpressure(sh, ctx, conn, queued)
     }
 }
@@ -1343,6 +1575,21 @@ unsafe fn receive(c: &ChanObj) -> PResult<PyRef> {
 unsafe fn task_done(c: &ChanObj, task: *mut PyObject) -> PResult<PyRef> {
     unsafe {
         let (sh, ctx) = worker()?;
+        finish_task_for(sh, &ctx, c.slot, c.generation, c.seq, task, false);
+        Ok(py::none())
+    }
+}
+
+unsafe fn finish_task_for(
+    sh: &Shared,
+    ctx: &AppCtx,
+    slot: u32,
+    generation: u32,
+    seq: u32,
+    task: *mut PyObject,
+    inline: bool,
+) {
+    unsafe {
         let report = ctx.report.as_ref().map(PyRef::ptr);
         let failed = match py::call_method(s().exception, &[task]) {
             Ok(exc) if py::is_none(exc.ptr()) => false,
@@ -1360,9 +1607,9 @@ unsafe fn task_done(c: &ChanObj, task: *mut PyObject) -> PResult<PyRef> {
                 true
             }
         };
-        if let Some(conn) = sh.conn(c.slot, c.generation) {
+        if let Some(conn) = sh.conn(slot, generation) {
             let mut st = conn.st.borrow_mut();
-            if st.seq == c.seq && st.ws.is_some() {
+            if st.seq == seq && st.ws.is_some() {
                 crate::ws::task_finished(&mut st, failed, sh.stopping.get());
                 if !st.disconnected && crate::http::flush_st(&conn, &mut st).is_err() {
                     st.disconnected = true;
@@ -1370,12 +1617,12 @@ unsafe fn task_done(c: &ChanObj, task: *mut PyObject) -> PResult<PyRef> {
                 }
                 drop(st);
                 conn.notify(sh);
-            } else if st.seq == c.seq && st.wt.is_some() {
+            } else if st.seq == seq && st.wt.is_some() {
                 crate::wt::task_finished(&mut st, failed);
                 drop(st);
                 crate::wt::wake_recv(&conn);
                 conn.notify(sh);
-            } else if st.seq == c.seq && !st.disconnected {
+            } else if st.seq == seq && !st.disconnected {
                 match st.resp.phase {
                     Phase::Idle => {
                         if !failed {
@@ -1393,14 +1640,29 @@ unsafe fn task_done(c: &ChanObj, task: *mut PyObject) -> PResult<PyRef> {
                     }
                     Phase::Done => {}
                 }
-                if crate::http::flush_st(&conn, &mut st).is_err() {
-                    st.disconnected = true;
-                    st.out.clear();
+                let batched = !inline
+                    && !st.out.is_empty()
+                    && st.resp.phase == Phase::Done
+                    && !st.resp.close
+                    && !st.h2
+                    && !st.h3
+                    && !sh.closing()
+                    && st.send_file.is_none();
+                if batched {
+                    drop(st);
+                    crate::http::flush_soon(sh, &conn);
+                    conn.notify(sh);
+                } else {
+                    if !st.out.is_empty() && crate::http::flush_st(&conn, &mut st).is_err() {
+                        st.disconnected = true;
+                        st.out.clear();
+                    }
+                    drop(st);
+                    if !inline {
+                        conn.notify(sh);
+                    }
                 }
-                drop(st);
-                conn.notify(sh);
             }
         }
-        Ok(py::none())
     }
 }

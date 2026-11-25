@@ -5,7 +5,7 @@
 //! no `Range`, no `Last-Modified`: ETag is the validator.
 
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::compress::{self, Coding};
@@ -93,16 +93,21 @@ pub fn open(
     Some(Opened {
         file: send,
         size: send_size,
+        mtime_secs: send_mtime / 1_000_000_000,
+        range: None,
         ctype,
         etag,
         coding,
-        vary: coding != Coding::Identity || compress::is_compressible(ctype),
+        vary: compress_static && (coding != Coding::Identity || compress::is_compressible(ctype)),
     })
 }
 
 pub struct Opened {
     pub file: File,
     pub size: u64,
+    pub mtime_secs: u64,
+    /// Optional inclusive `(start, end)` byte range for `206 Partial Content`.
+    pub range: Option<(u64, u64)>,
     pub ctype: &'static [u8],
     pub etag: String,
     pub coding: Coding,
@@ -110,20 +115,118 @@ pub struct Opened {
 }
 
 impl Opened {
-    /// 412, 304, or 200. `body` is `None` on 412/304/HEAD.
-    pub fn precondition(&self, headers: &[httparse::Header<'_>]) -> (u16, bool) {
+    /// 412, 304, 206, 416, or 200. `body` is `false` on 412/304/416.
+    pub fn precondition(&mut self, headers: &[httparse::Header<'_>]) -> (u16, bool) {
         if let Some(v) = header(headers, b"if-match")
             && !if_match(v, self.etag.as_bytes())
         {
             return (412, false);
         }
-        if let Some(v) = header(headers, b"if-none-match")
-            && if_none_match(v, self.etag.as_bytes())
+        if let Some(v) = header(headers, b"if-none-match") {
+            if if_none_match(v, self.etag.as_bytes()) {
+                return (304, false);
+            }
+        } else if self.mtime_secs > 0
+            && let Some(v) = header(headers, b"if-modified-since")
+            && let Some(ims) = crate::cache::parse_http_date(v)
+            && self.mtime_secs <= ims
         {
             return (304, false);
         }
+        if let Some(v) = header(headers, b"range") {
+            // Respect `If-Range` when present (ETag match only).
+            let range_ok = match header(headers, b"if-range") {
+                Some(ir) => ir.trim_ascii() == self.etag.as_bytes(),
+                None => true,
+            };
+            if range_ok {
+                match parse_single_range(v, self.size) {
+                    RangeResult::Satisfiable(start, end) => {
+                        self.range = Some((start, end));
+                        return (206, true);
+                    }
+                    RangeResult::Unsatisfiable => return (416, false),
+                    RangeResult::Ignore => {}
+                }
+            }
+        }
         (200, true)
     }
+}
+
+enum RangeResult {
+    Satisfiable(u64, u64),
+    Unsatisfiable,
+    Ignore,
+}
+
+/// Parses a single `bytes=start-end`, `bytes=start-`, or `bytes=-suffix` range
+/// (RFC 9110 §14.1.2). Multi-range requests are ignored (served as 200).
+fn parse_single_range(raw: &[u8], size: u64) -> RangeResult {
+    let raw = raw.trim_ascii();
+    let Some(spec) = raw.strip_prefix(b"bytes=").or_else(|| {
+        if raw.len() >= 6 && raw[..6].eq_ignore_ascii_case(b"bytes=") {
+            Some(&raw[6..])
+        } else {
+            None
+        }
+    }) else {
+        return RangeResult::Ignore;
+    };
+    if spec.contains(&b',') {
+        return RangeResult::Ignore;
+    }
+    let Some(dash) = spec.iter().position(|&c| c == b'-') else {
+        return RangeResult::Ignore;
+    };
+    let left = spec[..dash].trim_ascii();
+    let right = spec[dash + 1..].trim_ascii();
+    if left.is_empty() && right.is_empty() {
+        return RangeResult::Ignore;
+    }
+    if size == 0 {
+        return RangeResult::Unsatisfiable;
+    }
+    if left.is_empty() {
+        let Ok(suffix) = std::str::from_utf8(right)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .ok_or(())
+        else {
+            return RangeResult::Ignore;
+        };
+        if suffix == 0 {
+            return RangeResult::Unsatisfiable;
+        }
+        let start = size.saturating_sub(suffix);
+        return RangeResult::Satisfiable(start, size - 1);
+    }
+    let Ok(start) = std::str::from_utf8(left)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .ok_or(())
+    else {
+        return RangeResult::Ignore;
+    };
+    if start >= size {
+        return RangeResult::Unsatisfiable;
+    }
+    let end = if right.is_empty() {
+        size - 1
+    } else {
+        let Ok(e) = std::str::from_utf8(right)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .ok_or(())
+        else {
+            return RangeResult::Ignore;
+        };
+        if e < start {
+            return RangeResult::Ignore;
+        }
+        e.min(size - 1)
+    };
+    RangeResult::Satisfiable(start, end)
 }
 
 /// Writes the response. A large file is left on `st` for `flush_all` to pump.
@@ -140,13 +243,26 @@ pub fn write(
     stopping: bool,
 ) -> bool {
     let mut file = opened.file;
-    let body = st.resp.status == 200 && !head_only && opened.size > 0;
-    // A small file is read before the head goes out, so a file that shrank
+    let (send_len, seek_to) = match (st.resp.status, opened.range) {
+        (206, Some((start, end))) => (end - start + 1, Some(start)),
+        (200, _) => (opened.size, None),
+        _ => (0, None),
+    };
+    let body = matches!(st.resp.status, 200 | 206) && !head_only && send_len > 0;
+    if body
+        && let Some(pos) = seek_to
+        && file.seek(SeekFrom::Start(pos)).is_err()
+    {
+        st.keep_alive = false;
+        st.write_error(500);
+        return false;
+    }
+    // A small file/range is read before the head goes out, so a file that shrank
     // since it was opened is an error rather than a short body.
-    let inline = if body && opened.size <= INLINE {
-        let mut buf = Vec::with_capacity(opened.size as usize);
-        match (&mut file).take(opened.size).read_to_end(&mut buf) {
-            Ok(n) if n as u64 == opened.size => Some(buf),
+    let inline = if body && send_len <= INLINE {
+        let mut buf = Vec::with_capacity(send_len as usize);
+        match (&mut file).take(send_len).read_to_end(&mut buf) {
+            Ok(n) if n as u64 == send_len => Some(buf),
             _ => {
                 st.keep_alive = false;
                 st.write_error(500);
@@ -166,8 +282,14 @@ pub fn write(
     st.out.extend_from_slice(reason(st.resp.status));
     st.out.extend_from_slice(b"\r\ncontent-type: ");
     st.out.extend_from_slice(opened.ctype);
-    st.out.extend_from_slice(b"\r\netag: ");
+    st.out
+        .extend_from_slice(b"\r\naccept-ranges: bytes\r\netag: ");
     st.out.extend_from_slice(opened.etag.as_bytes());
+    if opened.mtime_secs > 0 {
+        let lm = crate::http::format_date(opened.mtime_secs);
+        st.out.extend_from_slice(b"\r\nlast-modified: ");
+        st.out.extend_from_slice(&lm);
+    }
     if opened.coding != Coding::Identity {
         st.out.extend_from_slice(b"\r\ncontent-encoding: ");
         st.out.extend_from_slice(opened.coding.token());
@@ -184,7 +306,22 @@ pub fn write(
     }
     st.out.extend_from_slice(b"\r\ndate: ");
     st.out.extend_from_slice(date);
-    if st.resp.status == 200 {
+    if st.resp.status == 206
+        && let Some((start, end)) = opened.range
+    {
+        st.out.extend_from_slice(b"\r\ncontent-range: bytes ");
+        push_int(&mut st.out, start);
+        st.out.extend_from_slice(b"-");
+        push_int(&mut st.out, end);
+        st.out.extend_from_slice(b"/");
+        push_int(&mut st.out, opened.size);
+        st.out.extend_from_slice(b"\r\ncontent-length: ");
+        push_int(&mut st.out, send_len);
+    } else if st.resp.status == 416 {
+        st.out.extend_from_slice(b"\r\ncontent-range: bytes */");
+        push_int(&mut st.out, opened.size);
+        st.out.extend_from_slice(b"\r\ncontent-length: 0");
+    } else if st.resp.status == 200 {
         st.out.extend_from_slice(b"\r\ncontent-length: ");
         push_int(&mut st.out, opened.size);
     } else {
@@ -205,7 +342,7 @@ pub fn write(
     } else if body {
         st.send_file = Some(Box::new(SendFile {
             file,
-            remaining: opened.size,
+            remaining: send_len,
         }));
     }
     true
@@ -371,7 +508,7 @@ fn content_type(name: &[u8]) -> &'static [u8] {
         Some(i) if name[i] == b'.' => &name[i + 1..],
         _ => return b"application/octet-stream",
     };
-    let mut buf = [0u8; 8];
+    let mut buf = [0u8; 16];
     if ext.len() > buf.len() {
         return b"application/octet-stream";
     }
@@ -381,9 +518,14 @@ fn content_type(name: &[u8]) -> &'static [u8] {
     match &buf[..ext.len()] {
         b"html" | b"htm" => b"text/html; charset=utf-8",
         b"css" => b"text/css; charset=utf-8",
-        b"js" | b"mjs" => b"text/javascript; charset=utf-8",
+        b"js" | b"mjs" | b"cjs" => b"text/javascript; charset=utf-8",
         b"json" | b"map" => b"application/json",
+        b"webmanifest" => b"application/manifest+json",
         b"txt" => b"text/plain; charset=utf-8",
+        b"md" => b"text/markdown; charset=utf-8",
+        b"csv" => b"text/csv; charset=utf-8",
+        b"yaml" | b"yml" => b"application/yaml",
+        b"toml" => b"application/toml",
         b"xml" => b"application/xml",
         b"svg" => b"image/svg+xml",
         b"png" => b"image/png",
@@ -401,7 +543,14 @@ fn content_type(name: &[u8]) -> &'static [u8] {
         b"mp4" => b"video/mp4",
         b"webm" => b"video/webm",
         b"mp3" => b"audio/mpeg",
+        b"ogg" => b"audio/ogg",
+        b"wav" => b"audio/wav",
+        b"flac" => b"audio/flac",
+        b"aac" => b"audio/aac",
         b"zip" => b"application/zip",
+        b"gz" => b"application/gzip",
+        b"tar" => b"application/x-tar",
+        b"7z" => b"application/x-7z-compressed",
         _ => b"application/octet-stream",
     }
 }
@@ -440,6 +589,8 @@ mod tests {
         Opened {
             file,
             size: claimed,
+            mtime_secs: 0,
+            range: None,
             ctype: b"application/octet-stream",
             etag: "\"0-0\"".into(),
             coding: Coding::Identity,

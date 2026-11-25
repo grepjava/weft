@@ -61,13 +61,15 @@ impl H2Tx {
             let eos = st.resp.phase == Phase::Done && st.send_file.is_none() && n == st.out.len();
             let data = st.out.split_to(n).freeze();
             send.send_data(data, eos).map_err(h2_err)?;
-            if !st.out.is_empty() {
+            if eos {
+                self.send = None;
+            } else if !st.out.is_empty() {
                 send.reserve_capacity(st.out.len());
                 return Ok(false);
             }
         } else if st.resp.phase == Phase::Done
             && st.send_file.is_none()
-            && let Some(send) = self.send.as_mut()
+            && let Some(mut send) = self.send.take()
         {
             let _ = send.send_data(Bytes::new(), true);
         }
@@ -79,7 +81,8 @@ impl H2Tx {
             return Poll::Ready(Ok(()));
         };
         match send.poll_capacity(cx) {
-            Poll::Ready(Some(Ok(_))) | Poll::Ready(None) => Poll::Ready(Ok(())),
+            Poll::Ready(Some(Ok(_))) => Poll::Ready(Ok(())),
+            Poll::Ready(None) => Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
             Poll::Ready(Some(Err(e))) => Poll::Ready(Err(h2_err(e))),
             Poll::Pending => Poll::Pending,
         }
@@ -208,16 +211,40 @@ pub async fn serve(
     } else {
         AsyncIo::prefixed(io, prefix)
     };
-    let mut h2: Connection<AsyncIo, Bytes> = match h2::server::handshake(io).await {
+    let mut builder = h2::server::Builder::new();
+    builder
+        .max_concurrent_streams(256)
+        .max_header_list_size(ctx.max_head.min(u32::MAX as usize) as u32)
+        .initial_window_size(256 * 1024)
+        .initial_connection_window_size(1024 * 1024);
+    let mut h2: Connection<AsyncIo, Bytes> = match builder.handshake(io).await {
         Ok(c) => c,
         Err(_) => return,
     };
-    while let Some(Ok((req, respond))) = h2.accept().await {
-        let sh = sh.clone();
-        let ctx = ctx.clone();
-        tokio::task::spawn_local(async move {
-            stream(sh, ctx, req, respond, peer, unix).await;
-        });
+    let mut shutting_down = false;
+    loop {
+        if shutting_down {
+            let _ = std::future::poll_fn(|cx| h2.poll_closed(cx)).await;
+            break;
+        }
+        tokio::select! {
+            _ = sh.stop.notified() => {
+                h2.graceful_shutdown();
+                shutting_down = true;
+            }
+            next = h2.accept() => {
+                match next {
+                    Some(Ok((req, respond))) => {
+                        let sh = sh.clone();
+                        let ctx = ctx.clone();
+                        tokio::task::spawn_local(async move {
+                            stream(sh, ctx, req, respond, peer, unix).await;
+                        });
+                    }
+                    Some(Err(_)) | None => break,
+                }
+            }
+        }
     }
 }
 

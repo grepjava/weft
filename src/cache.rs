@@ -19,7 +19,7 @@ use crate::asgi::{eq_ci, trim};
 const MAGIC: u64 = 0x5746_5443_4143_4846;
 const MAX_KEY: usize = 2048;
 const MAX_HEAD: usize = 16 * 1024;
-const META: usize = 80;
+const META: usize = 96;
 
 #[derive(Clone, Copy)]
 pub struct Cfg {
@@ -58,6 +58,12 @@ struct Slot {
     /// Odd while a write is in progress: a slot taken over from a dead
     /// writer is emptied rather than read half written.
     seq: AtomicU64,
+    /// Lock-free hint for `SlotData.hash` (0 when empty); lets misses skip
+    /// acquiring the spin-lock altogether.
+    hash_hint: AtomicU64,
+    /// Lock-free hint for `SlotData.target`; lets `invalidate` skip unrelated
+    /// slots without locking.
+    target_hint: AtomicU64,
     data: UnsafeCell<SlotData>,
 }
 
@@ -72,6 +78,8 @@ struct SlotData {
     key_len: u16,
     head_len: u16,
     body_len: u32,
+    /// Seconds since `stored_ms` when this slot was last hit (for LRU eviction).
+    used_offset_s: u32,
     variant: u64,
 }
 
@@ -154,6 +162,8 @@ impl SlotGuard {
                 };
                 if orphaned && slot.seq.load(Ordering::Relaxed) & 1 == 1 {
                     g.data().hash = 0;
+                    slot.hash_hint.store(0, Ordering::Relaxed);
+                    slot.target_hint.store(0, Ordering::Relaxed);
                     slot.seq.fetch_add(1, Ordering::Relaxed);
                 }
                 return Some(g);
@@ -365,7 +375,18 @@ pub struct Hit {
     pub ttl: u32,
 }
 
+#[cfg(test)]
 pub fn lookup(key: &[u8], variant: u64, now: Option<u64>) -> Option<Hit> {
+    lookup_inner(key, variant, false, now)
+}
+
+/// Single-pass lookup matching either an unvaried entry (`variant == 0`) or
+/// `variant`, skipping non-matching slots lock-free via `hash_hint`.
+pub fn lookup_any(key: &[u8], variant: u64, now: Option<u64>) -> Option<Hit> {
+    lookup_inner(key, variant, true, now)
+}
+
+fn lookup_inner(key: &[u8], variant: u64, allow_zero: bool, now: Option<u64>) -> Option<Hit> {
     let (t, classes) = classes()?;
     let hash = fnv(key);
     let clock = now_ms();
@@ -378,11 +399,15 @@ pub fn lookup(key: &[u8], variant: u64, now: Option<u64>) -> Option<Hit> {
         let start = (hash as usize) % c.n;
         for p in 0..8 {
             let i = (start + p) % c.n;
+            let slot = unsafe { &*slot_at(t, c, i) };
+            if slot.hash_hint.load(Ordering::Acquire) != hash {
+                continue;
+            }
             // A slot that stays busy is a miss, not a wait.
             let Some(mut g) = SlotGuard::lock(t, c, i, clock) else {
                 continue;
             };
-            if let Some(hit) = read_slot(&mut g, key, hash, variant, now, epoch) {
+            if let Some(hit) = read_slot(&mut g, key, hash, variant, allow_zero, now, epoch) {
                 return Some(hit);
             }
         }
@@ -395,11 +420,13 @@ fn read_slot(
     key: &[u8],
     hash: u64,
     variant: u64,
+    allow_zero: bool,
     now: u64,
     epoch: u64,
 ) -> Option<Hit> {
     let (s, pay) = g.parts();
-    if s.hash != hash || s.epoch != epoch || s.expiry_ms <= now || s.variant != variant {
+    let variant_ok = s.variant == variant || (allow_zero && s.variant == 0);
+    if s.hash != hash || s.epoch != epoch || s.expiry_ms <= now || !variant_ok {
         return None;
     }
     let (kl, hl, bl) = (s.key_len as usize, s.head_len as usize, s.body_len as usize);
@@ -416,6 +443,7 @@ fn read_slot(
     let age = s
         .age_sec
         .saturating_add(((now.saturating_sub(s.stored_ms)) / 1000) as u32);
+    s.used_offset_s = ((now.saturating_sub(s.stored_ms)) / 1000).min(u32::MAX as u64) as u32;
     let ttl = ((s.expiry_ms.saturating_sub(now)) / 1000) as u32;
     Some(Hit {
         status,
@@ -459,6 +487,7 @@ pub fn store(
         let start = (hash as usize) % c.n;
         let mut best = None;
         let mut best_rank = 4u8;
+        let mut best_lru = u64::MAX;
         for p in 0..8 {
             let i = (start + p) % c.n;
             // A busy slot is passed over.
@@ -477,9 +506,13 @@ pub fn store(
             } else {
                 2
             };
+            let lru = s
+                .stored_ms
+                .saturating_add(u64::from(s.used_offset_s).saturating_mul(1000));
             drop(g);
-            if rank < best_rank {
+            if rank < best_rank || (rank == 2 && best_rank == 2 && lru < best_lru) {
                 best_rank = rank;
+                best_lru = lru;
                 best = Some(i);
                 if rank == 0 {
                     break;
@@ -522,6 +555,7 @@ fn write_slot(
     s.expiry_ms = expiry;
     s.stored_ms = now;
     s.age_sec = age_sec;
+    s.used_offset_s = 0;
     s.variant = variant;
     let mut stored = Vec::with_capacity(8 + head.len());
     stored.extend_from_slice(status.to_string().as_bytes());
@@ -529,6 +563,8 @@ fn write_slot(
     stored.extend_from_slice(head);
     if key.len() + stored.len() + body.len() > pay.len() {
         s.hash = 0;
+        slot.hash_hint.store(0, Ordering::Release);
+        slot.target_hint.store(0, Ordering::Release);
         seq.fetch_add(1, Ordering::Relaxed);
         return;
     }
@@ -538,6 +574,8 @@ fn write_slot(
     s.key_len = key.len() as u16;
     s.head_len = stored.len() as u16;
     s.body_len = body.len() as u32;
+    slot.hash_hint.store(hash, Ordering::Release);
+    slot.target_hint.store(target, Ordering::Release);
     seq.fetch_add(1, Ordering::Relaxed);
     crate::metrics::cache_store();
 }
@@ -549,6 +587,10 @@ pub fn invalidate(target: u64) {
     let now = now_ms();
     for c in classes {
         for i in 0..c.n {
+            let slot = unsafe { &*slot_at(t, c, i) };
+            if slot.target_hint.load(Ordering::Acquire) != target {
+                continue;
+            }
             let Some(mut g) = SlotGuard::lock(t, c, i, now) else {
                 // A copy that cannot be reached must still not be served:
                 // retire every copy instead.
@@ -560,6 +602,8 @@ pub fn invalidate(target: u64) {
             let s = g.data();
             if s.target == target && s.hash != 0 {
                 s.expiry_ms = 0;
+                slot.hash_hint.store(0, Ordering::Release);
+                slot.target_hint.store(0, Ordering::Release);
                 seq.fetch_add(2, Ordering::Relaxed);
             }
         }
@@ -761,7 +805,7 @@ fn parse_u32(v: &[u8]) -> Option<u32> {
 /// An IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`) as Unix milliseconds.
 /// The obsolete forms are not read: without a Date the application's Age
 /// alone ages the response (RFC 9111 4.2.3).
-fn parse_http_date(v: &[u8]) -> Option<u64> {
+pub(crate) fn parse_http_date(v: &[u8]) -> Option<u64> {
     let v = trim(v);
     if v.len() != 29 || &v[3..5] != b", " || &v[25..] != b" GMT" {
         return None;

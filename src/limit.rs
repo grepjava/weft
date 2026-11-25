@@ -14,6 +14,8 @@ use memmap2::MmapMut;
 const SLOTS: usize = 65_536;
 const PROBES: usize = 16;
 
+pub const MAP_BYTES: usize = SLOTS * std::mem::size_of::<Slot>();
+
 #[repr(C)]
 struct Slot {
     /// Client key; 0 is empty.
@@ -143,6 +145,49 @@ pub fn name_key(name: &[u8]) -> u64 {
     if v == 0 { 1 } else { v }
 }
 
+fn mix64(mut x: u64) -> u64 {
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
+
+#[cfg(unix)]
+fn now_us() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    if rc == 0 {
+        (ts.tv_sec as u64)
+            .saturating_mul(1_000_000)
+            .saturating_add((ts.tv_nsec as u64) / 1_000)
+    } else {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_micros() as u64)
+    }
+}
+
+#[cfg(windows)]
+fn now_us() -> u64 {
+    let mut t: u64 = 0;
+    // 100-nanosecond ticks; divide by 10 for microseconds.
+    let ok = unsafe {
+        windows_sys::Win32::System::WindowsProgramming::QueryUnbiasedInterruptTime(&mut t)
+    };
+    if ok != 0 {
+        t / 10
+    } else {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_micros() as u64)
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn now_us() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -153,7 +198,7 @@ fn now_us() -> u64 {
 /// Returns microseconds to wait, or 0 when this one is allowed.
 fn charge(slots: &[Slot], key: u64, now: u64, emission: u64, burst: u64) -> u64 {
     let key = if key == 0 { 1 } else { key };
-    let start = (key as usize) & (SLOTS - 1);
+    let start = (mix64(key) as usize) & (SLOTS - 1);
     let mut empty = None;
     for n in 0..PROBES {
         let slot = &slots[(start + n) & (SLOTS - 1)];
@@ -186,7 +231,16 @@ fn charge(slots: &[Slot], key: u64, now: u64, emission: u64, burst: u64) -> u64 
         .tag
         .compare_exchange(tag, key, Ordering::AcqRel, Ordering::Acquire)
     {
-        Ok(_) => update(slot, now, emission, burst),
+        Ok(_) => {
+            // Reset any stale TAT from the evicted owner before charging.
+            let _ = slot.tat.compare_exchange(
+                tat,
+                now.saturating_add(emission),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            0
+        }
         Err(now_tag) if now_tag == key => update(slot, now, emission, burst),
         Err(_) => 0,
     }

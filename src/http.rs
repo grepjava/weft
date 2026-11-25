@@ -325,7 +325,15 @@ impl State {
         self.final_delivered = false;
         self.rejected = false;
         self.aborted = false;
-        self.resp = Resp::default();
+        let mut head = std::mem::take(&mut self.resp.head);
+        head.clear();
+        if head.capacity() > 4096 {
+            head.shrink_to(4096);
+        }
+        self.resp = Resp {
+            head,
+            ..Resp::default()
+        };
         self.request_id.clear();
         self.log = None;
         self.send_file = None;
@@ -338,7 +346,9 @@ impl State {
         self.cache_variant = 0;
         self.cache_ok = false;
         self.mutating = false;
-        self.started = tokio::time::Instant::now();
+        if crate::metrics::enabled() {
+            self.started = tokio::time::Instant::now();
+        }
     }
 
     pub(crate) fn log_response(&mut self, status: u16) {
@@ -435,7 +445,7 @@ impl State {
         }
     }
 
-    fn write_head(
+    pub(crate) fn write_head(
         &mut self,
         first_len: usize,
         more: bool,
@@ -473,13 +483,12 @@ impl State {
         } else {
             crate::compress::Coding::Identity
         };
-        let coding = elig.choose(
-            offered,
-            status,
-            !no_body,
-            self.resp.info.length,
-            ctx.compress_min,
-        );
+        let known_len = if !more {
+            Some(self.resp.info.length.unwrap_or(first_len as u64))
+        } else {
+            self.resp.info.length
+        };
+        let coding = elig.choose(offered, status, !no_body, known_len, ctx.compress_min);
         if coding != crate::compress::Coding::Identity {
             self.resp.head = crate::compress::rewrite_head(&self.resp.head, coding);
             self.resp.info.length = None;
@@ -497,7 +506,7 @@ impl State {
             out.extend_from_slice(coding.token());
             out.extend_from_slice(b"\r\n");
         }
-        if elig.may_vary(status) && !elig.vary_covered {
+        if ctx.compress && elig.may_vary(status) && !elig.vary_covered {
             out.extend_from_slice(b"vary: accept-encoding\r\n");
         }
         if let Some((age, ttl)) = self.cache_hit {
@@ -586,7 +595,10 @@ impl State {
             out.extend_from_slice(b"\"; ma=86400\r\n");
         }
         out.extend_from_slice(b"\r\n");
-        self.resp.head = Vec::new();
+        self.resp.head.clear();
+        if self.resp.head.capacity() > 4096 {
+            self.resp.head.shrink_to(4096);
+        }
         self.resp.framing = framing;
         self.resp.close = close;
         self.resp.phase = Phase::Body;
@@ -898,6 +910,7 @@ pub fn spawn(sh: &Rc<Shared>, io: Io, peer: SocketAddr, unix: bool) {
         entry.insert(conn.clone());
         conn
     };
+    sh.tcp_conns.set(sh.tcp_conns.get() + 1);
     crate::metrics::accepted();
     tokio::task::spawn_local(run(sh.clone(), conn));
 }
@@ -1150,8 +1163,11 @@ impl<S: BodySource> StreamBody<S> {
         if !self.chunked {
             rbuf.extend_from_slice(data);
         } else if !data.is_empty() {
-            use std::fmt::Write as _;
-            let _ = write!(rbuf, "{:x}\r\n", data.len());
+            let mut hex = [0u8; 18];
+            let n = fmt_hex(data.len(), &mut hex);
+            rbuf.reserve(n + data.len() + 4);
+            rbuf.extend_from_slice(&hex[..n]);
+            rbuf.extend_from_slice(b"\r\n");
             rbuf.extend_from_slice(data);
             rbuf.extend_from_slice(b"\r\n");
         }
@@ -1437,7 +1453,11 @@ pub(crate) fn pump(
             && p.stream_body.is_some()
             && !st.disconnected
             && st.resp.phase != Phase::Done
-            && conn.h2.borrow_mut().as_mut().is_some_and(|tx| tx.poll_gone(cx))
+            && conn
+                .h2
+                .borrow_mut()
+                .as_mut()
+                .is_some_and(|tx| tx.poll_gone(cx))
         {
             // With no body left to read, a reset (or the connection closing)
             // is the only sign the client has gone, as EOF is for HTTP/1.
@@ -1598,6 +1618,7 @@ async fn teardown(sh: &Shared, conn: &Rc<Conn>, rbuf: &mut BytesMut) {
     }
     conn.waker.borrow_mut().take();
     if !conn.stream {
+        sh.tcp_conns.set(sh.tcp_conns.get().saturating_sub(1));
         crate::metrics::closed();
     }
     sh.conns.borrow_mut().try_remove(conn.slot as usize);

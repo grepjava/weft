@@ -15,9 +15,46 @@
 //! than someone else's request, and deallocating one on another thread (as a
 //! free-threaded collector may) touches no server state.
 
+use std::cell::RefCell;
 use std::ffi::{CStr, c_int, c_void};
 use std::ptr;
 use std::sync::OnceLock;
+
+const POOL_MAX: usize = 32;
+
+thread_local! {
+    static READY_POOL: RefCell<Vec<usize>> = RefCell::new(Vec::with_capacity(POOL_MAX));
+    static SEND_POOL: RefCell<Vec<usize>> = RefCell::new(Vec::with_capacity(POOL_MAX));
+    static RECV_POOL: RefCell<Vec<usize>> = RefCell::new(Vec::with_capacity(POOL_MAX));
+    static DONE_POOL: RefCell<Vec<usize>> = RefCell::new(Vec::with_capacity(POOL_MAX));
+}
+
+#[inline]
+unsafe fn pool_pop(
+    pool: &'static std::thread::LocalKey<RefCell<Vec<usize>>>,
+) -> Option<*mut PyObject> {
+    let raw = pool.with(|p| p.borrow_mut().pop())?;
+    let o = raw as *mut PyObject;
+    unsafe {
+        let tp = Py_TYPE(o);
+        PyObject_Init(o, tp);
+        Py_DECREF(tp as *mut PyObject);
+    }
+    Some(o)
+}
+
+#[inline]
+fn pool_push(pool: &'static std::thread::LocalKey<RefCell<Vec<usize>>>, o: *mut PyObject) -> bool {
+    pool.with(|p| {
+        let mut p = p.borrow_mut();
+        if p.len() < POOL_MAX {
+            p.push(o as usize);
+            true
+        } else {
+            false
+        }
+    })
+}
 
 use pyo3_ffi::*;
 
@@ -103,9 +140,25 @@ pub unsafe fn alloc(tp: *mut PyObject, size: usize) -> PResult<*mut PyObject> {
 
 unsafe extern "C" fn plain_dealloc(o: *mut PyObject) {
     unsafe {
-        let tp = Py_TYPE(o);
+        let tp = Py_TYPE(o) as *mut PyObject;
+        if let Some(t) = TYPES.get() {
+            let pool = if tp == t.send.0 {
+                Some(&SEND_POOL)
+            } else if tp == t.receive.0 {
+                Some(&RECV_POOL)
+            } else if tp == t.done.0 {
+                Some(&DONE_POOL)
+            } else {
+                None
+            };
+            if let Some(pool) = pool
+                && pool_push(pool, o)
+            {
+                return;
+            }
+        }
         PyObject_Free(o as *mut c_void);
-        Py_DECREF(tp as *mut PyObject);
+        Py_DECREF(tp);
     }
 }
 
@@ -116,8 +169,18 @@ unsafe extern "C" fn ready_dealloc(o: *mut PyObject) {
         let r = o as *mut ReadyObj;
         let v = (*r).value;
         (*r).value = ptr::null_mut();
+        (*r).yield_first = false;
         Py_XDECREF(v);
-        plain_dealloc(o);
+        if TYPES
+            .get()
+            .is_some_and(|t| Py_TYPE(o) as *mut PyObject == t.ready.0)
+            && pool_push(&READY_POOL, o)
+        {
+            return;
+        }
+        let tp = Py_TYPE(o);
+        PyObject_Free(o as *mut c_void);
+        Py_DECREF(tp as *mut PyObject);
     }
 }
 
@@ -213,8 +276,13 @@ unsafe extern "C" fn ready_close(_o: *mut PyObject, _a: *mut PyObject) -> *mut P
 /// A complete awaitable returning `value` (stolen), or `None` when null.
 pub unsafe fn ready(value: Option<PyRef>) -> PResult<PyRef> {
     unsafe {
-        let o = alloc(types().ready.0, std::mem::size_of::<ReadyObj>())?;
-        (*(o as *mut ReadyObj)).value = value.map_or(ptr::null_mut(), PyRef::into_ptr);
+        let o = match pool_pop(&READY_POOL) {
+            Some(p) => p,
+            None => alloc(types().ready.0, std::mem::size_of::<ReadyObj>())?,
+        };
+        let r = o as *mut ReadyObj;
+        (*r).value = value.map_or(ptr::null_mut(), PyRef::into_ptr);
+        (*r).yield_first = false;
         PyRef::own(o)
     }
 }
@@ -238,7 +306,20 @@ pub unsafe fn chan(
     seq: u32,
 ) -> PResult<PyRef> {
     unsafe {
-        let o = alloc(kind.0, std::mem::size_of::<ChanObj>())?;
+        let t = types();
+        let pool = if kind.0 == t.send.0 {
+            Some(&SEND_POOL)
+        } else if kind.0 == t.receive.0 {
+            Some(&RECV_POOL)
+        } else if kind.0 == t.done.0 {
+            Some(&DONE_POOL)
+        } else {
+            None
+        };
+        let o = match pool.and_then(|p| pool_pop(p)) {
+            Some(p) => p,
+            None => alloc(kind.0, std::mem::size_of::<ChanObj>())?,
+        };
         let c = o as *mut ChanObj;
         (*c).vectorcall = Some(f);
         (*c).slot = slot;

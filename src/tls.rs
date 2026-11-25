@@ -4,6 +4,7 @@
 //! gets the default, so a browser can explain the mismatch.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::sync::Arc;
 
@@ -23,6 +24,8 @@ pub struct Io {
 struct Tls {
     conn: ServerConnection,
     plain: BytesMut,
+    peer_closed: bool,
+    close_sent: bool,
 }
 
 impl Io {
@@ -40,6 +43,8 @@ impl Io {
             tls: RefCell::new(Some(Box::new(Tls {
                 conn,
                 plain: BytesMut::new(),
+                peer_closed: false,
+                close_sent: false,
             }))),
         })
     }
@@ -117,31 +122,52 @@ impl Io {
             drop(g);
             return self.tcp.try_read(buf);
         };
-        if t.plain.is_empty() {
+        if t.plain.is_empty() && !t.peer_closed {
             match pull_tls(&self.tcp, t) {
-                Ok(0) => return Ok(0),
+                Ok(0) => t.peer_closed = true,
                 Ok(_) => {}
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                 Err(e) => return Err(e),
             }
             let _ = flush_tls(&self.tcp, &mut t.conn);
         }
-        if t.plain.is_empty() {
-            return Err(io::ErrorKind::WouldBlock.into());
+        if !t.plain.is_empty() {
+            let n = t.plain.len().min(buf.len());
+            buf[..n].copy_from_slice(&t.plain[..n]);
+            t.plain.advance(n);
+            return Ok(n);
         }
-        let n = t.plain.len().min(buf.len());
-        buf[..n].copy_from_slice(&t.plain[..n]);
-        t.plain.advance(n);
-        Ok(n)
+        if t.peer_closed {
+            return Ok(0);
+        }
+        Err(io::ErrorKind::WouldBlock.into())
     }
 
     pub fn try_read_buf(&self, buf: &mut BytesMut) -> io::Result<usize> {
-        let mut tmp = [0u8; 16 * 1024];
-        let n = self.try_read(&mut tmp)?;
-        if n > 0 {
-            buf.extend_from_slice(&tmp[..n]);
+        let mut g = self.tls.borrow_mut();
+        let Some(t) = g.as_mut() else {
+            drop(g);
+            return self.tcp.try_read_buf(buf);
+        };
+        if t.plain.is_empty() && !t.peer_closed {
+            match pull_tls(&self.tcp, t) {
+                Ok(0) => t.peer_closed = true,
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e),
+            }
+            let _ = flush_tls(&self.tcp, &mut t.conn);
         }
-        Ok(n)
+        if !t.plain.is_empty() {
+            let n = t.plain.len();
+            buf.extend_from_slice(&t.plain);
+            t.plain.clear();
+            return Ok(n);
+        }
+        if t.peer_closed {
+            return Ok(0);
+        }
+        Err(io::ErrorKind::WouldBlock.into())
     }
 
     pub fn try_write(&self, buf: &[u8]) -> io::Result<usize> {
@@ -155,7 +181,11 @@ impl Io {
             return Ok(0);
         }
         let n = t.conn.writer().write(buf)?;
-        let _ = flush_tls(&self.tcp, &mut t.conn);
+        match flush_tls(&self.tcp, &mut t.conn) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            Err(e) => return Err(e),
+        }
         Ok(n)
     }
 
@@ -209,9 +239,21 @@ impl Io {
         self.tcp.writable().await
     }
 
+    pub fn send_close_notify(&self) {
+        if let Some(t) = self.tls.borrow_mut().as_mut()
+            && !t.close_sent
+        {
+            t.close_sent = true;
+            t.conn.send_close_notify();
+        }
+    }
+
     pub fn shutdown_write(&self) {
         if let Some(t) = self.tls.borrow_mut().as_mut() {
-            t.conn.send_close_notify();
+            if !t.close_sent {
+                t.close_sent = true;
+                t.conn.send_close_notify();
+            }
             let _ = flush_tls(&self.tcp, &mut t.conn);
         }
         let _ = socket2::SockRef::from(&self.tcp).shutdown(std::net::Shutdown::Write);
@@ -219,26 +261,27 @@ impl Io {
 }
 
 fn pull_tls(tcp: &TcpStream, t: &mut Tls) -> io::Result<usize> {
-    let mut tmp = [0u8; 16 * 1024];
-    let n = tcp.try_read(&mut tmp)?;
-    if n == 0 {
-        return Ok(0);
-    }
-    let mut rest = &tmp[..n];
-    while !rest.is_empty() {
-        match t.conn.read_tls(&mut rest) {
-            Ok(0) => break,
-            Ok(_) => {}
-            Err(e) => return Err(e),
-        }
-    }
+    let mut r = TryTcp(tcp);
+    let n = t.conn.read_tls(&mut r)?;
     let state = t.conn.process_new_packets().map_err(tls_err)?;
+    if state.peer_has_closed() {
+        t.peer_closed = true;
+    }
     let want = state.plaintext_bytes_to_read();
     if want > 0 {
         t.plain.reserve(want);
-        let mut buf = vec![0u8; want];
-        let got = t.conn.reader().read(&mut buf).unwrap_or(0);
-        t.plain.extend_from_slice(&buf[..got]);
+        let mut tmp = [0u8; 16 * 1024];
+        loop {
+            match t.conn.reader().read(&mut tmp) {
+                Ok(0) => {
+                    t.peer_closed = true;
+                    break;
+                }
+                Ok(got) => t.plain.extend_from_slice(&tmp[..got]),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e),
+            }
+        }
     }
     Ok(n)
 }
@@ -257,6 +300,12 @@ fn flush_tls(tcp: &TcpStream, conn: &mut ServerConnection) -> io::Result<()> {
 }
 
 struct TryTcp<'a>(&'a TcpStream);
+
+impl Read for TryTcp<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.0.try_read(buf)
+    }
+}
 
 impl Write for TryTcp<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
@@ -280,19 +329,27 @@ pub fn load_config(pairs: &[(String, String)], alpn: Vec<Vec<u8>>) -> Result<Ser
     if pairs.is_empty() {
         return Err("tls needs a certificate and a key".into());
     }
-    let mut names = Vec::new();
+    let mut exact = HashMap::new();
+    let mut wildcards = HashMap::new();
     let mut keys = Vec::new();
     for (cert, key) in pairs {
         let (ck, sans) = certified(cert, key)?;
         let ck = Arc::new(ck);
         for n in sans {
-            names.push((n, ck.clone()));
+            if let Some(rest) = n.strip_prefix("*.") {
+                wildcards
+                    .entry(rest.to_string())
+                    .or_insert_with(|| ck.clone());
+            } else {
+                exact.entry(n).or_insert_with(|| ck.clone());
+            }
         }
         keys.push(ck);
     }
     let resolver = Arc::new(Resolver {
         default: keys[0].clone(),
-        names,
+        exact,
+        wildcards,
     });
     let mut cfg =
         ServerConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
@@ -357,7 +414,8 @@ fn dns_names(der: &CertificateDer<'_>) -> Vec<String> {
 #[derive(Debug)]
 struct Resolver {
     default: Arc<CertifiedKey>,
-    names: Vec<(String, Arc<CertifiedKey>)>,
+    exact: HashMap<String, Arc<CertifiedKey>>,
+    wildcards: HashMap<String, Arc<CertifiedKey>>,
 }
 
 impl ResolvesServerCert for Resolver {
@@ -374,16 +432,21 @@ impl ResolvesServerCert for Resolver {
 impl Resolver {
     fn lookup(&self, name: &str) -> Option<Arc<CertifiedKey>> {
         let name = name.to_ascii_lowercase();
-        for (pat, key) in &self.names {
-            if host_matches(pat, &name) {
-                return Some(key.clone());
-            }
+        if let Some(k) = self.exact.get(&name) {
+            return Some(k.clone());
+        }
+        if let Some((left, right)) = name.split_once('.')
+            && !left.is_empty()
+            && let Some(k) = self.wildcards.get(right)
+        {
+            return Some(k.clone());
         }
         None
     }
 }
 
 /// RFC 6125: a `*` covers exactly one label.
+#[cfg(test)]
 fn host_matches(pat: &str, name: &str) -> bool {
     if let Some(rest) = pat.strip_prefix("*.") {
         let Some((left, right)) = name.split_once('.') else {
@@ -471,22 +534,29 @@ impl tokio::io::AsyncWrite for AsyncIo {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<io::Result<()>> {
-        match self.io.flush_tls_only() {
-            Ok(true) => std::task::Poll::Ready(Ok(())),
-            Ok(false) => match self.io.poll_write_ready(cx) {
-                std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(())),
-                std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(e)),
-                std::task::Poll::Pending => std::task::Poll::Pending,
-            },
-            Err(e) => std::task::Poll::Ready(Err(e)),
+        loop {
+            match self.io.flush_tls_only() {
+                Ok(true) => return std::task::Poll::Ready(Ok(())),
+                Ok(false) => match self.io.poll_write_ready(cx) {
+                    std::task::Poll::Ready(Ok(())) => continue,
+                    std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
+                    std::task::Poll::Pending => return std::task::Poll::Pending,
+                },
+                Err(e) => return std::task::Poll::Ready(Err(e)),
+            }
         }
     }
 
     fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<io::Result<()>> {
-        self.io.shutdown_write();
+        self.io.send_close_notify();
+        match tokio::io::AsyncWrite::poll_flush(self.as_mut(), cx) {
+            std::task::Poll::Pending => return std::task::Poll::Pending,
+            std::task::Poll::Ready(Err(_)) | std::task::Poll::Ready(Ok(())) => {}
+        }
+        let _ = socket2::SockRef::from(&self.io.tcp).shutdown(std::net::Shutdown::Write);
         std::task::Poll::Ready(Ok(()))
     }
 }

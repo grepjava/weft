@@ -41,13 +41,13 @@ const I_DUR_SUM: usize = 15;
 const I_BUCKET0: usize = 16;
 const N: usize = I_BUCKET0 + BUCKETS;
 
-#[repr(C)]
+#[repr(C, align(64))]
 struct Header {
     magic: AtomicU64,
     workers: AtomicU64,
 }
 
-#[repr(C)]
+#[repr(C, align(64))]
 struct Slot {
     v: [AtomicU64; N],
 }
@@ -90,8 +90,12 @@ pub fn install(map: Option<&str>, workers: u64) -> io::Result<()> {
             (Some(mmap), ptr)
         }
         None => {
-            let mut v = vec![0u8; PAGE_BYTES];
-            let ptr = v.as_mut_ptr();
+            #[repr(C, align(64))]
+            #[derive(Clone, Copy)]
+            struct CacheLine([u64; 8]);
+            let lines = PAGE_BYTES.div_ceil(64);
+            let mut v = vec![CacheLine([0; 8]); lines];
+            let ptr = v.as_mut_ptr() as *mut u8;
             std::mem::forget(v);
             (None, ptr)
         }
@@ -130,7 +134,11 @@ pub fn bind(slot: usize, max_conns: u64) {
 pub fn add(i: usize, n: u64) {
     let Some(t) = TABLE.get() else { return };
     let slot = SLOT.with(|c| c.get());
-    unsafe { (*t.slots.add(slot)).v[i].fetch_add(n, Ordering::Relaxed) };
+    unsafe {
+        let cell = &(*t.slots.add(slot)).v[i];
+        let v = cell.load(Ordering::Relaxed);
+        cell.store(v.wrapping_add(n), Ordering::Relaxed);
+    }
 }
 
 fn set(i: usize, n: u64) {
@@ -412,12 +420,28 @@ async fn scrape(io: Io, cache: bool) {
             Err(_) => return,
         }
     }
-    let body = render(cache);
-    let mut head = Vec::with_capacity(160 + body.len());
-    head.extend_from_slice(b"HTTP/1.1 200 OK\r\ncontent-type: text/plain; version=0.0.4; charset=utf-8\r\ncontent-length: ");
-    push_int(&mut head, body.len() as u64);
-    head.extend_from_slice(b"\r\nconnection: close\r\n\r\n");
-    head.extend_from_slice(&body);
+    let first_line = buf.as_ref().split(|&c| c == b'\n').next().unwrap_or(&[]);
+    let first_line = first_line.strip_suffix(b"\r").unwrap_or(first_line);
+    let mut parts = first_line.split(|&c| c == b' ');
+    let method = parts.next().unwrap_or(&[]);
+    let target = parts.next().unwrap_or(&[]);
+    let path = target.split(|&c| c == b'?').next().unwrap_or(target);
+    let head = if method != b"GET" && method != b"HEAD" {
+        b"HTTP/1.1 405 Method Not Allowed\r\nallow: GET, HEAD\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            .to_vec()
+    } else if path != b"/metrics" && path != b"/" {
+        b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_vec()
+    } else {
+        let body = render(cache);
+        let mut head = Vec::with_capacity(160 + if method == b"HEAD" { 0 } else { body.len() });
+        head.extend_from_slice(b"HTTP/1.1 200 OK\r\ncontent-type: text/plain; version=0.0.4; charset=utf-8\r\ncontent-length: ");
+        push_int(&mut head, body.len() as u64);
+        head.extend_from_slice(b"\r\nconnection: close\r\n\r\n");
+        if method != b"HEAD" {
+            head.extend_from_slice(&body);
+        }
+        head
+    };
     let mut off = 0;
     while off < head.len() {
         if tokio::time::timeout_at(deadline, io.writable())

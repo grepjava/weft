@@ -6,6 +6,7 @@ import asyncio
 import signal
 import sys
 import threading
+import time
 
 from . import _gc
 from ._weft import Worker
@@ -31,7 +32,10 @@ def run(config: Config, sock, stop=None, app=None, exclusive=False, ready=None, 
     config.prepare()
     if app is None:
         app = config.load_app()
+    protocol = config.protocol_for(app)
     worker = Worker()
+    if protocol == 'wsgi':
+        return _run_wsgi(config, app, worker, sock, stop, exclusive, ready, quit)
     loop = WeftEventLoop(worker)
     asyncio.set_event_loop(loop)
     try:
@@ -43,6 +47,90 @@ def run(config: Config, sock, stop=None, app=None, exclusive=False, ready=None, 
             pass
         asyncio.set_event_loop(None)
         loop.close()
+
+
+def _run_wsgi(config: Config, app, worker: Worker, sock, stop, exclusive, ready, quit) -> int:
+    """Asyncio-free WSGI worker loop: drives Tokio directly via `Worker.select`."""
+    stopping = threading.Event()
+    interrupted = threading.Event()
+
+    def trigger(ev: threading.Event):
+        ev.set()
+        stopping.set()
+        worker.wakeup()
+
+    def watch(flag, ev):
+        def wait():
+            flag.wait()
+            trigger(ev)
+
+        threading.Thread(target=wait, name='weft-stop-watch', daemon=True).start()
+
+    if stop is not None:
+        watch(stop, stopping)
+    if quit is not None:
+        watch(quit, interrupted)
+
+    prev_signals: dict = {}
+    if threading.current_thread() is threading.main_thread():
+        sigs = [
+            (signal.SIGINT, interrupted),
+            (signal.SIGTERM, stopping),
+            (getattr(signal, 'SIGBREAK', None), interrupted),
+            (getattr(signal, 'SIGQUIT', None), interrupted),
+        ]
+        for sig, ev in sigs:
+            if sig is not None:
+                prev_signals[sig] = signal.getsignal(sig)
+                signal.signal(sig, lambda *_, ev=ev: trigger(ev))
+        if hasattr(signal, 'SIGHUP'):
+            prev_signals[signal.SIGHUP] = signal.getsignal(signal.SIGHUP)
+            signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
+    try:
+        options = config.serve_options()
+        options['protocol'] = 'wsgi'
+        options['state'] = None
+        options['report'] = report_app_error
+        options['exclusive'] = exclusive
+        worker.serve(sock.fileno(), app, None, options)
+        if ready is not None:
+            ready.set()
+        _gc.tune()
+        try:
+            name = sock.getsockname()
+        except OSError:
+            name = 'unix'
+        logger.debug('wsgi worker serving on %s', name)
+
+        while not stopping.is_set():
+            worker.select(None)
+
+        if config.drain_delay > 0 and not interrupted.is_set():
+            worker.drain()
+            logger.info('draining for %gs before shutting down', config.drain_delay)
+            drain_end = time.monotonic() + config.drain_delay
+            while not interrupted.is_set():
+                rem = drain_end - time.monotonic()
+                if rem <= 0:
+                    break
+                worker.select(min(rem, 0.05))
+
+        worker.shutdown()
+        deadline = time.monotonic() + config.graceful_timeout
+        while worker.connections():
+            rem = deadline - time.monotonic()
+            if rem <= 0:
+                break
+            worker.select(min(rem, 0.05))
+        return 0
+    finally:
+        for sig, prev in prev_signals.items():
+            try:
+                signal.signal(sig, prev)
+            except (OSError, ValueError):
+                pass
+        worker.close()
 
 
 def _watch(stop, loop, stopping: asyncio.Event) -> None:

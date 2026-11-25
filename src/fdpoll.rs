@@ -70,7 +70,11 @@ pub fn wait_writable(io: &tokio::net::TcpStream, ms: i32) -> bool {
     let fd = std::os::fd::AsRawFd::as_raw_fd(io) as i64;
     #[cfg(windows)]
     let fd = std::os::windows::io::AsRawSocket::as_raw_socket(io) as i64;
-    imp::wait_writable(fd, ms)
+    // Release the GIL while blocking in poll/WSAPoll so other Python threads can run.
+    let saved = unsafe { pyo3_ffi::PyEval_SaveThread() };
+    let ok = imp::wait_writable(fd, ms);
+    unsafe { pyo3_ffi::PyEval_RestoreThread(saved) };
+    ok
 }
 
 #[cfg(unix)]
@@ -138,7 +142,13 @@ mod imp {
                 revents: 0,
             })
             .collect();
-        let n = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, 0) };
+        let n = loop {
+            let n = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, 0) };
+            if n < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            break n;
+        };
         if n <= 0 {
             return;
         }
@@ -164,7 +174,13 @@ mod imp {
             events: libc::POLLOUT,
             revents: 0,
         };
-        unsafe { libc::poll(&mut p, 1, ms) > 0 }
+        loop {
+            let n = unsafe { libc::poll(&mut p, 1, ms) };
+            if n < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return n > 0;
+        }
     }
 }
 

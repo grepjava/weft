@@ -69,9 +69,12 @@ class WeftSelector(selectors._BaseSelectorImpl):
         return key
 
     def select(self, timeout=None):
+        evs = self._worker.select(timeout)
+        if not evs:
+            return ()
         fd_to_key = self._fd_to_key
         ready = []
-        for fd, events in self._worker.select(timeout):
+        for fd, events in evs:
             key = fd_to_key.get(fd)
             if key is not None:
                 events &= key.events

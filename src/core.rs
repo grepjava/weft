@@ -88,8 +88,10 @@ pub struct AppCtx {
     pub loop_: PyRef,
     pub task_type: PyRef,
     pub future_type: PyRef,
-    /// `("loop",)`, the kwnames for `Task(coro, loop=...)` and `Future(loop=...)`.
+    /// `("loop",)`, the kwnames for `Future(loop=...)` (and `Task` on <3.12).
     pub kw_loop: PyRef,
+    /// `("loop", "eager_start")` on 3.12+, or `("loop",)` on <3.12, for `Task(...)`.
+    pub kw_task: PyRef,
     /// Every constant scope entry, shallow-copied per request.
     pub scope_proto: PyRef,
     /// The same for the `websocket` scope.
@@ -177,6 +179,8 @@ pub struct Shared {
     main_waker: RefCell<Option<Waker>>,
     app: RefCell<Option<Rc<AppCtx>>>,
     pub conns: RefCell<Slab<Rc<Conn>>>,
+    /// O(1) count of non-stream (TCP / QUIC) connections for `max_conns` admission.
+    pub tcp_conns: Cell<usize>,
     generation: Cell<u32>,
     pub stopping: Cell<bool>,
     /// `--drain-delay` is running: still serving, but the health check fails
@@ -186,6 +190,9 @@ pub struct Shared {
     pub stop: Notify,
     /// Raw header name as received -> lowercased `bytes`, bounded.
     hcache: RefCell<HashMap<Box<[u8]>, PyRef, BuildHasherDefault<Fnv>>>,
+    /// Reusable scratch buffers for `poll_regs`.
+    hinted_scratch: RefCell<Vec<(i64, u32)>>,
+    confirmed_scratch: RefCell<Vec<u32>>,
     date: Cell<(u64, [u8; 29])>,
     /// Sends completed without waiting since the last `select`.
     sends: Cell<u32>,
@@ -229,13 +236,7 @@ impl Shared {
             },
             None => crate::tls::Io::plain(io),
         };
-        let tcp = self
-            .conns
-            .borrow()
-            .iter()
-            .filter(|(_, c)| !c.stream)
-            .count();
-        if tcp >= self.max_conns.get() {
+        if self.tcp_conns.get() >= self.max_conns.get() {
             // Closing with the request unread would reset the connection and
             // could lose the answer, so what arrives is read and dropped for
             // a moment first.
@@ -373,7 +374,8 @@ impl Shared {
         if regs.is_empty() {
             return;
         }
-        let mut hinted: Vec<(i64, u32)> = Vec::new();
+        let mut hinted = self.hinted_scratch.borrow_mut();
+        hinted.clear();
         for (&fd, reg) in regs.iter() {
             let h = reg.hint(cx);
             if h != 0 {
@@ -383,9 +385,9 @@ impl Shared {
         if hinted.is_empty() {
             return;
         }
-        let mut confirmed = Vec::new();
+        let mut confirmed = self.confirmed_scratch.borrow_mut();
         fdpoll::confirm(&hinted, &mut confirmed);
-        for (&(fd, hint), &ok) in hinted.iter().zip(&confirmed) {
+        for (&(fd, hint), &ok) in hinted.iter().zip(confirmed.iter()) {
             if ok != 0 {
                 events.push((fd, ok));
             }
@@ -435,12 +437,15 @@ impl Core {
                 main_waker: RefCell::new(None),
                 app: RefCell::new(None),
                 conns: RefCell::new(Slab::with_capacity(256)),
+                tcp_conns: Cell::new(0),
                 generation: Cell::new(0),
                 stopping: Cell::new(false),
                 draining: Cell::new(false),
                 max_conns: Cell::new(usize::MAX),
                 stop: Notify::new(),
                 hcache: RefCell::new(HashMap::default()),
+                hinted_scratch: RefCell::new(Vec::new()),
+                confirmed_scratch: RefCell::new(Vec::new()),
                 date: Cell::new((0, [0; 29])),
                 sends: Cell::new(0),
                 #[cfg(windows)]
@@ -468,16 +473,21 @@ impl Core {
             Some(t) if t > 0.0 => Some(Instant::now() + Duration::from_secs_f64(t.min(86_400.0))),
             _ => None,
         };
-        let sh = self.sh.clone();
-        let remote = self.remote.clone();
-        let events = self.rt.block_on(async move {
+        let sh = &self.sh;
+        let remote = &self.remote;
+        let events = self.rt.block_on(async {
             let mut events = Vec::new();
             let mut notified = pin!(remote.notify.notified());
-            let mut sleep = deadline.map(|d| Box::pin(tokio::time::sleep_until(d.into())));
+            let mut sleep = pin!(tokio::time::sleep_until(
+                deadline
+                    .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400))
+                    .into()
+            ));
+            let has_deadline = deadline.is_some();
             let mut yielded = pin!(tokio::task::yield_now());
             let mut spins = 0u32;
             std::future::poll_fn(|cx| {
-                crate::http::run_flush_soon(&sh);
+                crate::http::run_flush_soon(sh);
                 sh.run_deferred();
                 {
                     let mut w = sh.main_waker.borrow_mut();
@@ -498,9 +508,7 @@ impl Core {
                     // skips the park hooks), and return.
                     return yielded.as_mut().poll(cx);
                 }
-                if let Some(s) = sleep.as_mut()
-                    && s.as_mut().poll(cx).is_ready()
-                {
+                if has_deadline && sleep.as_mut().poll(cx).is_ready() {
                     return Poll::Ready(());
                 }
                 Poll::Pending
@@ -554,7 +562,8 @@ impl Core {
         let _ = exclusive;
         #[cfg(unix)]
         let listener = if unix {
-            let std = std::os::unix::net::UnixListener::from(std::os::fd::OwnedFd::from(dup_socket(fd)?));
+            let std =
+                std::os::unix::net::UnixListener::from(std::os::fd::OwnedFd::from(dup_socket(fd)?));
             Listener::Unix(tokio::net::UnixListener::from_std(std)?)
         } else {
             Listener::Tcp(TcpListener::from_std(dup_socket(fd)?.into())?)
@@ -704,7 +713,10 @@ impl Listener {
                 let (s, _) = l.accept().await?;
                 let fd = s.into_std()?.into_raw_fd();
                 let s = unsafe { std::net::TcpStream::from_raw_fd(fd) };
-                Ok((tokio::net::TcpStream::from_std(s)?, SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0))))
+                Ok((
+                    tokio::net::TcpStream::from_std(s)?,
+                    SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0)),
+                ))
             }
         }
     }

@@ -16,14 +16,14 @@ import tempfile
 import threading
 import time
 
-from . import log, worker
+from . import _weft, log, worker
 from .config import Config
 from .log import logger
 
-# Must match `limit.rs` (`SLOTS * size_of::<Slot>()`).
-_RATE_MAP_BYTES = 65_536 * 16
-# Must match `metrics.rs` PAGE_BYTES (Header + 64 slots × 29 counters).
-_METRICS_PAGE_BYTES = 16 + 64 * 29 * 8
+
+_RATE_MAP_BYTES = _weft.RATE_MAP_BYTES
+_METRICS_PAGE_BYTES = _weft.METRICS_PAGE_BYTES
+_REDIRECT_MAX_CONNS = 64
 
 
 def bind(host: str, port: int, backlog: int) -> socket.socket:
@@ -136,6 +136,7 @@ def _start_redirect(config: Config, https_sock) -> threading.Event | None:
             return
         sock.settimeout(0.3)
         logger.info('redirecting http://%s:%d to https port %d', host, port, https_port)
+        sem = threading.Semaphore(_REDIRECT_MAX_CONNS)
         try:
             while not stop.is_set():
                 try:
@@ -144,7 +145,13 @@ def _start_redirect(config: Config, https_sock) -> threading.Event | None:
                     continue
                 except OSError:
                     break
-                threading.Thread(target=_redirect_one, args=(conn, https_port), daemon=True).start()
+                if not sem.acquire(blocking=False):
+                    try:
+                        conn.close()
+                    except OSError:
+                        pass
+                    continue
+                threading.Thread(target=_redirect_one, args=(conn, https_port, sem), daemon=True).start()
         finally:
             sock.close()
 
@@ -152,7 +159,7 @@ def _start_redirect(config: Config, https_sock) -> threading.Event | None:
     return stop
 
 
-def _redirect_one(conn: socket.socket, https_port: int) -> None:
+def _redirect_one(conn: socket.socket, https_port: int, sem: threading.Semaphore) -> None:
     try:
         conn.settimeout(2)
         buf = b''
@@ -164,31 +171,44 @@ def _redirect_one(conn: socket.socket, https_port: int) -> None:
         line = buf.split(b'\r\n', 1)[0]
         parts = line.split(b' ')
         target = parts[1].decode('ascii', 'replace') if len(parts) > 1 else '/'
-        if not target.startswith('/'):
+        # Reject non-path, scheme-relative (`//evil.com`), or control-char targets.
+        if not target.startswith('/') or target.startswith('//') or any(ord(c) < 0x20 or ord(c) == 0x7F for c in target):
             target = '/'
         host = 'localhost'
         for raw in buf.split(b'\r\n'):
             if raw.lower().startswith(b'host:'):
-                host = raw.split(b':', 1)[1].strip().decode('ascii', 'replace')
-                if ':' in host and not host.startswith('['):
-                    host = host.rsplit(':', 1)[0]
+                cand = raw.split(b':', 1)[1].strip().decode('ascii', 'replace')
+                if cand and not any(ord(c) < 0x20 or ord(c) == 0x7F or c in ' /\\@' for c in cand):
+                    if cand.startswith('['):
+                        end = cand.find(']')
+                        host = cand[: end + 1] if end != -1 else 'localhost'
+                    elif ':' in cand:
+                        host = cand.rsplit(':', 1)[0]
+                    else:
+                        host = cand
                 break
         loc = f'https://{host}{"" if https_port == 443 else f":{https_port}"}{target}'
-        body = b''
         resp = (
             b'HTTP/1.1 301 Moved Permanently\r\n'
-            b'location: ' + loc.encode() + b'\r\n'
+            b'location: ' + loc.encode('ascii', 'replace') + b'\r\n'
             b'content-length: 0\r\n'
-            b'connection: close\r\n\r\n' + body
+            b'connection: close\r\n\r\n'
         )
         conn.sendall(resp)
     except OSError:
         pass
     finally:
+        sem.release()
         try:
             conn.close()
         except OSError:
             pass
+
+
+def _shm_dir() -> str | None:
+    if sys.platform.startswith('linux') and os.path.isdir('/dev/shm') and os.access('/dev/shm', os.W_OK):
+        return '/dev/shm'
+    return None
 
 
 def _ensure_rate_map(config: Config, n: int) -> str | None:
@@ -198,7 +218,7 @@ def _ensure_rate_map(config: Config, n: int) -> str | None:
     # reload, or more than one process, have to share a file.
     if not (config.reload or (n > 1 and config.worker_mode == 'process')):
         return None
-    fd, path = tempfile.mkstemp(prefix='weft-rl-')
+    fd, path = tempfile.mkstemp(prefix='weft-rl-', dir=_shm_dir())
     os.ftruncate(fd, _RATE_MAP_BYTES)
     os.close(fd)
     config.rate_limit_map = path
@@ -210,7 +230,7 @@ def _ensure_cache_map(config: Config, n: int) -> str | None:
         return None
     if not (config.reload or (n > 1 and config.worker_mode == 'process')):
         return None
-    fd, path = tempfile.mkstemp(prefix='weft-cache-')
+    fd, path = tempfile.mkstemp(prefix='weft-cache-', dir=_shm_dir())
     os.ftruncate(fd, max(1, config.cache_size) * 1024 * 1024)
     os.close(fd)
     config.cache_map = path
@@ -222,7 +242,7 @@ def _ensure_metrics_map(config: Config, n: int) -> str | None:
         return None
     if not (config.reload or (n > 1 and config.worker_mode == 'process')):
         return None
-    fd, path = tempfile.mkstemp(prefix='weft-metrics-')
+    fd, path = tempfile.mkstemp(prefix='weft-metrics-', dir=_shm_dir())
     os.ftruncate(fd, _METRICS_PAGE_BYTES)
     os.close(fd)
     config.metrics_map = path
@@ -467,18 +487,24 @@ def _run_supervisor(config: Config, sock, n: int) -> int:
         def rolling(why: str) -> None:
             logger.info(why)
             config.cache_flush = True
-            for i, slot in enumerate(slots):
-                try:
-                    fresh = spawn(i)
-                except RuntimeError:
-                    logger.error('cannot spawn a replacement for worker %d; keeping the current one', i)
-                    return
-                slot.quit.set()
-                slot.proc.join(config.graceful_timeout + 5)
-                _reap(slot.proc)
-                slots[i] = fresh
+            try:
+                for i, slot in enumerate(slots):
+                    try:
+                        fresh = spawn(i)
+                    except RuntimeError:
+                        logger.error('cannot spawn a replacement for worker %d; keeping the current one', i)
+                        return
+                    # Only the first replacement worker needs to flush the shared cache.
+                    config.cache_flush = False
+                    slot.quit.set()
+                    slot.proc.join(config.graceful_timeout + 5)
+                    _reap(slot.proc)
+                    slots[i] = fresh
+            finally:
+                config.cache_flush = False
             logger.info('workers reloaded')
 
+        restarts: list[tuple[float, int]] = [(0.0, 0)] * n
         try:
             while not terminating:
                 if reload_wanted and not shutting:
@@ -492,7 +518,22 @@ def _run_supervisor(config: Config, sock, n: int) -> int:
                     if slot.proc.exitcode == 3:
                         logger.error('worker %d failed to start; shutting down', i)
                         return 3
-                    logger.warning('worker %d (pid %s) exited with %s; restarting', i, slot.proc.pid, slot.proc.exitcode)
+                    now = time.monotonic()
+                    last_t, count = restarts[i]
+                    count = count + 1 if now - last_t < 30.0 else 1
+                    restarts[i] = (now, count)
+                    backoff = min(5.0, 0.25 * (2 ** (count - 1))) if count > 1 else 0.0
+                    logger.warning(
+                        'worker %d (pid %s) exited with %s; restarting%s',
+                        i,
+                        slot.proc.pid,
+                        slot.proc.exitcode,
+                        f' in {backoff:.2f}s' if backoff else '',
+                    )
+                    if backoff:
+                        time.sleep(backoff)
+                        if terminating:
+                            break
                     try:
                         slots[i] = spawn(i)
                     except RuntimeError:

@@ -146,3 +146,49 @@ def test_file_cut_short_closes_the_connection(tmp_path):
                 got += chunk
         body = got.split(b'\r\n\r\n', 1)[1]
         assert len(body) < size
+
+
+def test_range_206_and_416(static_url):
+    r = httpx.get(static_url + '/static/app.css', headers={'Range': 'bytes=0-3'})
+    assert r.status_code == 206
+    assert r.content == b'body'
+    assert r.headers['accept-ranges'] == 'bytes'
+    assert r.headers['content-range'] == 'bytes 0-3/15'
+    assert r.headers['content-length'] == '4'
+
+    # Suffix range
+    s = httpx.get(static_url + '/static/app.css', headers={'Range': 'bytes=-4'})
+    assert s.status_code == 206
+    assert s.content == b'red}'
+    assert s.headers['content-range'] == 'bytes 11-14/15'
+
+    # Unsatisfiable range
+    bad = httpx.get(static_url + '/static/app.css', headers={'Range': 'bytes=100-200'})
+    assert bad.status_code == 416
+    assert bad.headers['content-range'] == 'bytes */15'
+
+
+def test_last_modified_and_if_modified_since(static_url):
+    r = httpx.get(static_url + '/static/app.css')
+    lm = r.headers['last-modified']
+    assert lm.endswith('GMT')
+    n = httpx.get(static_url + '/static/app.css', headers={'If-Modified-Since': lm})
+    assert n.status_code == 304
+    assert n.content == b''
+
+
+def test_asgi_pathsend(tmp_path):
+    target = tmp_path / 'sample.txt'
+    payload = b'hello from pathsend!\n' * 100
+    target.write_bytes(payload)
+
+    async def pathsend_app(scope, receive, send):
+        assert 'http.response.pathsend' in scope['extensions']
+        await send({'type': 'http.response.start', 'status': 200, 'headers': [(b'content-type', b'text/plain')]})
+        await send({'type': 'http.response.pathsend', 'path': str(target)})
+
+    with serve_thread(pathsend_app, lifespan='off') as url:
+        r = httpx.get(url + '/')
+        assert r.status_code == 200
+        assert r.content == payload
+        assert int(r.headers['content-length']) == len(payload)

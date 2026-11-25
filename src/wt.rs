@@ -265,7 +265,7 @@ fn attach_bidi(sh: &Shared, session: &Rc<Session>, stream_id: u64, io: H3Bidi) {
     let session = session.clone();
     tokio::task::spawn_local(async move {
         let (send, recv) = io.split();
-        tokio::task::spawn_local(run_h3send(st.clone(), send));
+        tokio::task::spawn_local(run_h3send(session.clone(), st.clone(), send));
         run_h3recv(session.clone(), st, recv).await;
         session.kick.notify_waiters();
     });
@@ -282,12 +282,13 @@ fn attach_uni(sh: &Shared, session: &Rc<Session>, stream_id: u64, io: H3Uni) {
     let _ = sh;
 }
 
-async fn run_h3send<S>(st: Rc<Stream>, mut send: S)
+async fn run_h3send<S>(session: Rc<Session>, st: Rc<Stream>, mut send: S)
 where
     S: SendStream<Bytes> + SendStreamUnframed<Bytes>,
 {
     loop {
-        let wait = st.kick.notified();
+        let mut wait = std::pin::pin!(st.kick.notified());
+        wait.as_mut().enable();
         let mut data = st.out.borrow_mut().split();
         while !data.is_empty() {
             match poll_fn(|cx| SendStreamUnframed::poll_send(&mut send, cx, &mut data)).await {
@@ -303,9 +304,12 @@ where
             {
                 st.fin_sent.set(true);
             }
+            if st.end_delivered.get() || !st.bidirectional {
+                session.streams.borrow_mut().remove(&st.id);
+            }
             return;
         }
-        if st.fin_sent.get() {
+        if st.fin_sent.get() || session.gone.get() {
             return;
         }
         wait.await;
@@ -321,12 +325,14 @@ where
         if session.gone.get() {
             return;
         }
-        let wait = st.kick.notified();
-        if st.paused.get() || st.buf.borrow().len() >= MAX_STREAM_BUF {
-            wait.await;
-            continue;
+        {
+            let mut wait = std::pin::pin!(st.kick.notified());
+            wait.as_mut().enable();
+            if st.paused.get() || st.buf.borrow().len() >= MAX_STREAM_BUF {
+                wait.await;
+                continue;
+            }
         }
-        drop(wait);
         match poll_fn(|cx| RecvStream::poll_data(&mut io, cx)).await {
             Ok(Some(mut buf)) => {
                 let b = buf.copy_to_bytes(buf.remaining());
@@ -459,7 +465,7 @@ impl Session {
             st.recv_closed.set(true);
             st.end_delivered.set(true);
         }
-        tokio::task::spawn_local(run_h3send(st.clone(), send));
+        tokio::task::spawn_local(run_h3send(self.clone(), st.clone(), send));
         if let Some(recv) = recv {
             tokio::task::spawn_local(run_h3recv(self.clone(), st, recv));
         }
@@ -650,19 +656,26 @@ pub fn encode_varint(out: &mut Vec<u8>, v: u64) {
     }
 }
 
-pub fn parse_capsules(buf: &[u8], mut on_close: impl FnMut(u64, Vec<u8>)) {
+pub fn parse_capsules_buf(buf: &mut BytesMut, mut on_close: impl FnMut(u64, Vec<u8>)) {
     let mut i = 0;
     while i < buf.len() {
+        let start = i;
         let Some((ty, n)) = decode_varint(&buf[i..]) else {
             break;
         };
         i += n;
         let Some((len, n)) = decode_varint(&buf[i..]) else {
+            i = start;
             break;
         };
         i += n;
-        let len = len as usize;
-        if i + len > buf.len() {
+        let Ok(len) = usize::try_from(len) else {
+            // Unrepresentable capsule length: discard malformed remainder.
+            buf.clear();
+            return;
+        };
+        if len > buf.len() - i {
+            i = start;
             break;
         }
         let payload = &buf[i..i + len];
@@ -680,6 +693,9 @@ pub fn parse_capsules(buf: &[u8], mut on_close: impl FnMut(u64, Vec<u8>)) {
             };
             on_close(code, reason);
         }
+    }
+    if i > 0 {
+        buf.advance(i);
     }
 }
 
@@ -745,7 +761,8 @@ pub unsafe fn start(
             i.webtransport_stream_resume,
             i.webtransport_datagram_send,
         );
-        asgi::launch(sh, ctx, conn, d, receive_vc, send_vc, seq)
+        asgi::launch(sh, ctx, conn, d, receive_vc, send_vc, seq, false)?;
+        Ok(())
     }
 }
 
@@ -1081,13 +1098,20 @@ fn send_on(ctx: &AppCtx, conn: Option<&Conn>, id: u64, data: &[u8], end: bool) -
         if !st.writable.get() {
             return Err(py::runtime_error("this stream cannot be written to"));
         }
+        if st.end_queued.get() {
+            return Err(py::runtime_error("stream write side already closed"));
+        }
         if !data.is_empty() {
-            st.out.borrow_mut().extend_from_slice(data);
+            let mut out = st.out.borrow_mut();
+            if out.len().saturating_add(data.len()) > 4 * 1024 * 1024 {
+                return Err(py::runtime_error("webtransport stream send buffer full"));
+            }
+            out.extend_from_slice(data);
         }
         if end {
             st.end_queued.set(true);
         }
-        st.kick.notify_waiters();
+        st.kick.notify_one();
         Ok(ctx.done.clone())
     }
 }

@@ -33,7 +33,6 @@ const KEY_CACHE: usize = 512;
 pub struct WsgiCtx {
     /// The per-server part of every environ, copied for each request.
     pub proto: PyRef,
-    pub bytes_io: PyRef,
     /// `SCRIPT_NAME`, stripped from the front of `PATH_INFO`.
     pub root: Vec<u8>,
     keys: RefCell<HashMap<Box<[u8]>, PyRef, BuildHasherDefault<Fnv>>>,
@@ -42,16 +41,12 @@ pub struct WsgiCtx {
 
 impl WsgiCtx {
     pub unsafe fn new(proto: PyRef, root: &[u8], pool: Option<Pool>) -> PResult<WsgiCtx> {
-        unsafe {
-            let io = py::import(c"io")?;
-            Ok(WsgiCtx {
-                proto,
-                bytes_io: py::getattr(io.ptr(), c"BytesIO")?,
-                root: root.strip_suffix(b"/").unwrap_or(root).to_vec(),
-                keys: RefCell::new(HashMap::default()),
-                pool,
-            })
-        }
+        Ok(WsgiCtx {
+            proto,
+            root: root.strip_suffix(b"/").unwrap_or(root).to_vec(),
+            keys: RefCell::new(HashMap::default()),
+            pool,
+        })
     }
 
     /// `HTTP_` plus the header name upper-cased, with `-` as `_`.
@@ -232,7 +227,7 @@ pub unsafe fn environ(
                 d,
                 i.wsgi_url_scheme,
                 if secure {
-                    py::str_ascii(b"https")?
+                    PyRef::borrow(i.https)
                 } else {
                     PyRef::borrow(i.http)
                 },
@@ -302,6 +297,183 @@ struct StartResponseObj {
 }
 
 static START_TYPE: OnceLock<Static> = OnceLock::new();
+static INPUT_TYPE: OnceLock<Static> = OnceLock::new();
+
+#[repr(C)]
+struct WsgiInputObj {
+    ob_base: PyObject,
+    data: *mut PyObject,
+    pos: usize,
+}
+
+unsafe extern "C" fn input_dealloc(o: *mut PyObject) {
+    unsafe {
+        let inp = o as *mut WsgiInputObj;
+        let d = (*inp).data;
+        (*inp).data = ptr::null_mut();
+        Py_XDECREF(d);
+        let tp = Py_TYPE(o);
+        PyObject_Free(o as *mut c_void);
+        Py_DECREF(tp as *mut PyObject);
+    }
+}
+
+unsafe fn input_slice(inp: &WsgiInputObj) -> &'static [u8] {
+    unsafe {
+        let ptr = PyBytes_AsString(inp.data) as *const u8;
+        let len = PyBytes_Size(inp.data) as usize;
+        std::slice::from_raw_parts(ptr, len)
+    }
+}
+
+unsafe fn parse_opt_size(args: *const *mut PyObject, nargs: Py_ssize_t) -> PResult<Option<usize>> {
+    unsafe {
+        if nargs == 0 {
+            return Ok(None);
+        }
+        if nargs > 1 {
+            return Err(py::type_error("expected at most 1 argument"));
+        }
+        let a = *args;
+        if py::is_none(a) {
+            return Ok(None);
+        }
+        let n = py::i64_arg(a)?;
+        Ok(if n < 0 { None } else { Some(n as usize) })
+    }
+}
+
+unsafe extern "C" fn input_read(
+    o: *mut PyObject,
+    args: *mut *mut PyObject,
+    nargs: Py_ssize_t,
+) -> *mut PyObject {
+    unsafe {
+        let inp = &mut *(o as *mut WsgiInputObj);
+        let size = match parse_opt_size(args, nargs) {
+            Ok(s) => s,
+            Err(_) => return ptr::null_mut(),
+        };
+        let buf = input_slice(inp);
+        let rem = buf.len().saturating_sub(inp.pos);
+        let take = size.map_or(rem, |s| s.min(rem));
+        if take == 0 {
+            return PyRef::borrow(empty_bytes()).into_ptr();
+        }
+        if inp.pos == 0 && take == buf.len() {
+            inp.pos = buf.len();
+            return PyRef::borrow(inp.data).into_ptr();
+        }
+        let start = inp.pos;
+        inp.pos += take;
+        match py::bytes(&buf[start..inp.pos]) {
+            Ok(b) => b.into_ptr(),
+            Err(_) => ptr::null_mut(),
+        }
+    }
+}
+
+unsafe fn next_line(inp: &mut WsgiInputObj, limit: Option<usize>) -> PResult<Option<PyRef>> {
+    let buf = unsafe { input_slice(inp) };
+    if inp.pos >= buf.len() {
+        return Ok(None);
+    }
+    let rest = &buf[inp.pos..];
+    let max = limit.map_or(rest.len(), |s| s.min(rest.len()));
+    if max == 0 {
+        return Ok(Some(unsafe { PyRef::borrow(empty_bytes()) }));
+    }
+    let end = match rest[..max].iter().position(|&c| c == b'\n') {
+        Some(i) => i + 1,
+        None => max,
+    };
+    let start = inp.pos;
+    inp.pos += end;
+    Ok(Some(unsafe { py::bytes(&buf[start..inp.pos])? }))
+}
+
+unsafe extern "C" fn input_readline(
+    o: *mut PyObject,
+    args: *mut *mut PyObject,
+    nargs: Py_ssize_t,
+) -> *mut PyObject {
+    unsafe {
+        let inp = &mut *(o as *mut WsgiInputObj);
+        let size = match parse_opt_size(args, nargs) {
+            Ok(s) => s,
+            Err(_) => return ptr::null_mut(),
+        };
+        match next_line(inp, size) {
+            Ok(Some(b)) => b.into_ptr(),
+            Ok(None) => PyRef::borrow(empty_bytes()).into_ptr(),
+            Err(_) => ptr::null_mut(),
+        }
+    }
+}
+
+unsafe extern "C" fn input_readlines(
+    o: *mut PyObject,
+    args: *mut *mut PyObject,
+    nargs: Py_ssize_t,
+) -> *mut PyObject {
+    unsafe {
+        let inp = &mut *(o as *mut WsgiInputObj);
+        let hint = match parse_opt_size(args, nargs) {
+            Ok(s) => s,
+            Err(_) => return ptr::null_mut(),
+        };
+        let Ok(list) = PyRef::own(PyList_New(0)) else {
+            return ptr::null_mut();
+        };
+        let mut total = 0usize;
+        loop {
+            match next_line(inp, None) {
+                Ok(Some(line)) => {
+                    let n = PyBytes_Size(line.ptr()) as usize;
+                    if PyList_Append(list.ptr(), line.ptr()) < 0 {
+                        return ptr::null_mut();
+                    }
+                    total += n;
+                    if let Some(h) = hint
+                        && h > 0
+                        && total >= h
+                    {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => return ptr::null_mut(),
+            }
+        }
+        list.into_ptr()
+    }
+}
+
+unsafe extern "C" fn input_iter(o: *mut PyObject) -> *mut PyObject {
+    unsafe { Py_INCREF(o) };
+    o
+}
+
+unsafe extern "C" fn input_iternext(o: *mut PyObject) -> *mut PyObject {
+    unsafe {
+        let inp = &mut *(o as *mut WsgiInputObj);
+        match next_line(inp, None) {
+            Ok(Some(b)) => b.into_ptr(),
+            Ok(None) | Err(_) => ptr::null_mut(),
+        }
+    }
+}
+
+unsafe fn wsgi_input(body: PyRef) -> PResult<PyRef> {
+    unsafe {
+        let tp = INPUT_TYPE.get().expect("wsgi::init").0;
+        let o = types::alloc(tp, std::mem::size_of::<WsgiInputObj>())?;
+        let inp = &mut *(o as *mut WsgiInputObj);
+        inp.data = body.into_ptr();
+        inp.pos = 0;
+        PyRef::own(o)
+    }
+}
 
 unsafe extern "C" fn sr_dealloc(o: *mut PyObject) {
     unsafe {
@@ -343,6 +515,49 @@ pub unsafe fn init() -> PResult<()> {
         )?
     };
     let _ = START_TYPE.set(Static(t));
+    if INPUT_TYPE.get().is_none() {
+        let methods: &'static mut [PyMethodDef] = Box::leak(Box::new([
+            PyMethodDef {
+                ml_name: c"read".as_ptr(),
+                ml_meth: PyMethodDefPointer {
+                    PyCFunctionFast: input_read,
+                },
+                ml_flags: METH_FASTCALL,
+                ml_doc: ptr::null(),
+            },
+            PyMethodDef {
+                ml_name: c"readline".as_ptr(),
+                ml_meth: PyMethodDefPointer {
+                    PyCFunctionFast: input_readline,
+                },
+                ml_flags: METH_FASTCALL,
+                ml_doc: ptr::null(),
+            },
+            PyMethodDef {
+                ml_name: c"readlines".as_ptr(),
+                ml_meth: PyMethodDefPointer {
+                    PyCFunctionFast: input_readlines,
+                },
+                ml_flags: METH_FASTCALL,
+                ml_doc: ptr::null(),
+            },
+            unsafe { std::mem::zeroed() },
+        ]));
+        let it = unsafe {
+            new_type(
+                c"weft._weft.WsgiInput",
+                std::mem::size_of::<WsgiInputObj>(),
+                Py_TPFLAGS_DEFAULT | Py_TPFLAGS_IMMUTABLETYPE | Py_TPFLAGS_DISALLOW_INSTANTIATION,
+                vec![
+                    slot(Py_tp_dealloc, input_dealloc as *mut c_void),
+                    slot(Py_tp_iter, input_iter as *mut c_void),
+                    slot(Py_tp_iternext, input_iternext as *mut c_void),
+                    slot(Py_tp_methods, methods.as_mut_ptr() as *mut c_void),
+                ],
+            )?
+        };
+        let _ = INPUT_TYPE.set(Static(it));
+    }
     Ok(())
 }
 
@@ -839,11 +1054,25 @@ unsafe fn prepare(w: &WsgiCtx, conn: &Conn, environ: &PyRef) -> PResult<PyRef> {
         let d = environ.ptr();
         let n = PyBytes_Size(body.ptr());
         if n > 0 && PyDict_Contains(d, i.content_length_env) == 0 {
-            let mut v = Vec::with_capacity(20);
-            push_int(&mut v, n as u64);
-            py::dict_set(d, i.content_length_env, py::str_ascii(&v)?)?;
+            let mut buf = [0u8; 20];
+            let mut v = n as u64;
+            let mut idx = buf.len();
+            loop {
+                idx -= 1;
+                buf[idx] = b'0' + (v % 10) as u8;
+                v /= 10;
+                if v == 0 {
+                    break;
+                }
+            }
+            py::dict_set(d, i.content_length_env, py::str_ascii(&buf[idx..])?)?;
         }
-        let input = py::call(w.bytes_io.ptr(), &[body.ptr()])?;
+        let _ = w;
+        let stderr = PySys_GetObject(c"stderr".as_ptr());
+        if !stderr.is_null() {
+            py::dict_set(d, i.wsgi_errors, PyRef::borrow(stderr))?;
+        }
+        let input = wsgi_input(body)?;
         py::dict_set(d, i.wsgi_input, input)?;
         start_response(conn)
     }

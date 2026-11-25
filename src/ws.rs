@@ -402,7 +402,7 @@ impl Ws {
         } else {
             // For a compressed message this bounds the compressed bytes;
             // inflating is bounded again, against the same limit.
-            if self.msg.len() + frame.len() > cfg.max_message {
+            if self.msg.len().saturating_add(frame.len()) > cfg.max_message {
                 return Err(TOO_BIG);
             }
             if self.msg.is_empty() {
@@ -440,45 +440,49 @@ impl Ws {
     /// Inflates one message. 1009 when it would inflate past the message
     /// limit (a few kilobytes of zeros can claim gigabytes), 1007 when it is
     /// not deflate data at all.
-    fn inflate(&mut self, mut input: BytesMut, max: usize) -> Result<Vec<u8>, u16> {
+    fn inflate(&mut self, input: BytesMut, max: usize) -> Result<Vec<u8>, u16> {
         let client_no_context = self.deflate.as_ref().is_some_and(|d| d.client_no_context);
         let z = self
             .inflater
             .get_or_insert_with(|| Box::new(Decompress::new_with_window_bits(false, 15)));
-        // The sender strips the empty block that ends a sync flush.
-        input.extend_from_slice(&[0, 0, 0xff, 0xff]);
-        let mut out: Vec<u8> = Vec::with_capacity((input.len() * 3).max(256).min(max + 1));
-        let mut rest = &input[..];
-        loop {
-            if out.len() == out.capacity() {
+        let cap_limit = max.saturating_add(1);
+        let mut out: Vec<u8> =
+            Vec::with_capacity(input.len().saturating_mul(3).max(256).min(cap_limit));
+        // The sender strips the empty block that ends a sync flush; feed the
+        // input slice then the 4-byte trailer without reallocating `input`.
+        for chunk in [&input[..], &[0u8, 0, 0xff, 0xff][..]] {
+            let mut rest = chunk;
+            loop {
+                if out.len() == out.capacity() {
+                    if out.len() > max {
+                        return Err(TOO_BIG);
+                    }
+                    let room = (cap_limit - out.len()).min(out.len().max(4096));
+                    out.reserve_exact(room);
+                }
+                let before = z.total_in();
+                let status = z
+                    .decompress_vec(rest, &mut out, FlushDecompress::Sync)
+                    .map_err(|_| INVALID_PAYLOAD)?;
+                let consumed = (z.total_in() - before) as usize;
+                rest = &rest[consumed..];
                 if out.len() > max {
                     return Err(TOO_BIG);
                 }
-                let room = (max + 1 - out.len()).min(out.len().max(4096));
-                out.reserve_exact(room);
-            }
-            let before = z.total_in();
-            let status = z
-                .decompress_vec(rest, &mut out, FlushDecompress::Sync)
-                .map_err(|_| INVALID_PAYLOAD)?;
-            let consumed = (z.total_in() - before) as usize;
-            rest = &rest[consumed..];
-            if out.len() > max {
-                return Err(TOO_BIG);
-            }
-            if status == Status::StreamEnd {
-                // The client ended its stream: the next message starts a
-                // fresh one.
-                z.reset(false);
-                break;
-            }
-            // Output space left over means zlib took all it could.
-            if out.len() < out.capacity() {
-                if rest.is_empty() {
+                if status == Status::StreamEnd {
+                    // The client ended its stream: the next message starts a
+                    // fresh one.
+                    z.reset(false);
                     break;
                 }
-                if consumed == 0 {
-                    return Err(INVALID_PAYLOAD);
+                // Output space left over means zlib took all it could.
+                if out.len() < out.capacity() {
+                    if rest.is_empty() {
+                        break;
+                    }
+                    if consumed == 0 {
+                        return Err(INVALID_PAYLOAD);
+                    }
                 }
             }
         }
@@ -582,14 +586,18 @@ fn parse_header(b: &[u8], max: usize, deflate: bool) -> Result<Option<Header>, u
             if b.len() < 4 {
                 return Ok(None);
             }
-            (u16::from_be_bytes([b[2], b[3]]) as u64, 4)
+            let v = u16::from_be_bytes([b[2], b[3]]) as u64;
+            if v < 126 {
+                return Err(PROTOCOL_ERROR);
+            }
+            (v, 4)
         }
         127 => {
             if b.len() < 10 {
                 return Ok(None);
             }
             let v = u64::from_be_bytes(b[2..10].try_into().unwrap_or_default());
-            if v >> 63 != 0 {
+            if v >> 63 != 0 || v <= 0xffff {
                 return Err(PROTOCOL_ERROR);
             }
             (v, 10)
@@ -602,13 +610,15 @@ fn parse_header(b: &[u8], max: usize, deflate: bool) -> Result<Option<Header>, u
     if b.len() < off + 4 {
         return Ok(None);
     }
+    let header_len = off + 4;
+    let total = (len as usize).checked_add(header_len).ok_or(TOO_BIG)?;
     Ok(Some(Header {
         fin,
         rsv1,
         opcode,
         mask: [b[off], b[off + 1], b[off + 2], b[off + 3]],
-        header_len: off + 4,
-        total: off + 4 + len as usize,
+        header_len,
+        total,
     }))
 }
 
@@ -690,7 +700,8 @@ pub unsafe fn start(
             )?;
         }
         py::dict_set(d, i.subprotocols, subprotocols(req)?)?;
-        asgi::launch(sh, ctx, conn, d, receive_vc, send_vc, seq)
+        asgi::launch(sh, ctx, conn, d, receive_vc, send_vc, seq, false)?;
+        Ok(())
     }
 }
 
@@ -793,7 +804,7 @@ fn pump(
             ws.decode(rbuf, &mut st.out, cfg);
         }
 
-        while !st.out.is_empty() && !st.disconnected {
+        while (!st.out.is_empty() || conn.io().tls_wants_write()) && !st.disconnected {
             match conn.io().poll_write_ready(cx) {
                 Poll::Ready(Ok(())) => {
                     if flush(&conn.io(), &mut st.out).is_err() {
@@ -813,6 +824,7 @@ fn pump(
         if ws.close_sent
             && (ws.close_received || ws.failed)
             && st.out.is_empty()
+            && !conn.io().tls_wants_write()
             && !ws.shut
             && !st.disconnected
         {
@@ -920,7 +932,7 @@ fn pump(
             continue;
         }
 
-        let flushed = st.out.is_empty() || st.disconnected;
+        let flushed = (st.out.is_empty() && !conn.io().tls_wants_write()) || st.disconnected;
         if ws.rejected {
             if st.resp.phase == Phase::Done && flushed {
                 return Poll::Ready(());
@@ -1265,25 +1277,30 @@ unsafe fn send_data(
 ) -> PResult<PyRef> {
     unsafe {
         let i = s();
-        let (text, payload) = match py::dict_get(msg, i.text)? {
-            Some(t) if !py::is_none(t.ptr()) => {
+        let text_obj = py::dict_get(msg, i.text)?.filter(|t| !py::is_none(t.ptr()));
+        let bytes_obj = py::dict_get(msg, i.bytes_)?.filter(|b| !py::is_none(b.ptr()));
+        if text_obj.is_some() && bytes_obj.is_some() {
+            return Err(py::raise(
+                PyExc_ValueError,
+                "'websocket.send' cannot have both 'bytes' and 'text'",
+            ));
+        }
+        let (text, payload) = match (text_obj, bytes_obj) {
+            (Some(t), None) => {
                 if PyUnicode_Check(t.ptr()) == 0 {
                     return Err(py::type_error("'websocket.send' text must be str"));
                 }
                 (true, PyRef::borrow(t.ptr()))
             }
-            _ => match py::dict_get(msg, i.bytes_)? {
-                Some(b) if PyBytes_Check(b.ptr()) != 0 => (false, PyRef::borrow(b.ptr())),
-                Some(b) if !py::is_none(b.ptr()) => {
-                    (false, PyRef::own(PyBytes_FromObject(b.ptr()))?)
-                }
-                _ => {
-                    return Err(py::raise(
-                        PyExc_ValueError,
-                        "'websocket.send' needs 'bytes' or 'text'",
-                    ));
-                }
-            },
+            (None, Some(b)) if PyBytes_Check(b.ptr()) != 0 => (false, PyRef::borrow(b.ptr())),
+            (None, Some(b)) => (false, PyRef::own(PyBytes_FromObject(b.ptr()))?),
+            (None, None) => {
+                return Err(py::raise(
+                    PyExc_ValueError,
+                    "'websocket.send' needs 'bytes' or 'text'",
+                ));
+            }
+            (Some(_), Some(_)) => unreachable!(),
         };
         let data: &[u8] = if text {
             py::str_view(payload.ptr())?

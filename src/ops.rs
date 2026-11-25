@@ -163,7 +163,7 @@ pub fn forwarded(t: &Trusted, headers: &[httparse::Header<'_>]) -> Via {
                         let (k, v) = (trim(&pair[..eq]), &pair[eq + 1..]);
                         if eq_ci(k, b"for") {
                             fwd_for.push(node_addr(v));
-                        } else if eq_ci(k, b"proto") {
+                        } else if eq_ci(k, b"proto") && fwd_proto.is_none() {
                             fwd_proto = proto_secure(v);
                         }
                     }
@@ -177,12 +177,8 @@ pub fn forwarded(t: &Trusted, headers: &[httparse::Header<'_>]) -> Via {
                         .filter(|v| !v.is_empty()),
                 );
             }
-            17 if eq_ci(name, b"x-forwarded-proto") => {
-                xfp = h
-                    .value
-                    .split(|&c| c == b',')
-                    .next_back()
-                    .and_then(proto_secure);
+            17 if eq_ci(name, b"x-forwarded-proto") && xfp.is_none() => {
+                xfp = h.value.split(|&c| c == b',').next().and_then(proto_secure);
             }
             _ => {}
         }
@@ -226,11 +222,17 @@ fn next_u64() -> u64 {
     })
 }
 
-/// A random (version 4) UUID, in its usual text form.
+/// A cryptographically random (version 4) UUID, in its usual text form.
 pub fn new_request_id() -> Vec<u8> {
     let mut b = [0u8; 16];
-    b[..8].copy_from_slice(&next_u64().to_le_bytes());
-    b[8..].copy_from_slice(&next_u64().to_le_bytes());
+    let ok = rustls::crypto::ring::default_provider()
+        .secure_random
+        .fill(&mut b)
+        .is_ok();
+    if !ok {
+        b[..8].copy_from_slice(&next_u64().to_le_bytes());
+        b[8..].copy_from_slice(&next_u64().to_le_bytes());
+    }
     b[6] = (b[6] & 0x0f) | 0x40;
     b[8] = (b[8] & 0x3f) | 0x80;
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -285,8 +287,49 @@ pub struct LogReq {
     /// The method, a space, then the target.
     pub line: Vec<u8>,
     pub method_len: usize,
-    pub http11: bool,
+    /// 0 = HTTP/1.0, 1 = HTTP/1.1, 2 = HTTP/2, 3 = HTTP/3.
+    pub proto: u8,
     pub trace: Option<([u8; 32], [u8; 16])>,
+}
+
+enum LogMsg {
+    Write(Vec<u8>),
+    SetFile(Option<String>),
+}
+
+static LOG_TX: std::sync::OnceLock<std::sync::mpsc::SyncSender<LogMsg>> =
+    std::sync::OnceLock::new();
+
+fn log_tx() -> &'static std::sync::mpsc::SyncSender<LogMsg> {
+    LOG_TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<LogMsg>(256);
+        let _ = std::thread::Builder::new()
+            .name("weft-log".into())
+            .spawn(move || {
+                let mut file: Option<std::fs::File> = None;
+                while let Ok(msg) = rx.recv() {
+                    match msg {
+                        LogMsg::SetFile(path) => {
+                            file = path.and_then(|p| {
+                                std::fs::OpenOptions::new()
+                                    .create(true)
+                                    .append(true)
+                                    .open(p)
+                                    .ok()
+                            });
+                        }
+                        LogMsg::Write(buf) => {
+                            if let Some(f) = file.as_mut() {
+                                let _ = f.write_all(&buf);
+                            } else {
+                                let _ = std::io::stderr().lock().write_all(&buf);
+                            }
+                        }
+                    }
+                }
+            });
+        tx
+    })
 }
 
 struct AccessLog {
@@ -317,7 +360,10 @@ pub async fn flusher() {
 const LOG_FLUSH_AT: usize = 32 * 1024;
 
 /// Turns this worker thread's access log on (text or JSON) or off.
-pub fn configure(format: Option<bool>) {
+pub fn configure(format: Option<bool>, file: Option<String>) {
+    if format.is_some() || LOG_TX.get().is_some() {
+        let _ = log_tx().send(LogMsg::SetFile(file));
+    }
     LOG.with(|l| {
         flush_into(&mut l.borrow_mut());
         *l.borrow_mut() = format.map(|json| AccessLog {
@@ -336,8 +382,8 @@ fn flush_into(l: &mut Option<AccessLog>) {
     if let Some(l) = l
         && !l.buf.is_empty()
     {
-        let _ = std::io::stderr().lock().write_all(&l.buf);
-        l.buf.clear();
+        let out = std::mem::replace(&mut l.buf, Vec::with_capacity(LOG_FLUSH_AT));
+        let _ = log_tx().try_send(LogMsg::Write(out));
     }
 }
 
@@ -390,10 +436,11 @@ pub fn record(req: &LogReq, status: u16, request_id: &[u8]) {
             push_int(b, status as u64);
             b.extend_from_slice(b",\"duration_us\":");
             push_int(b, micros);
-            b.extend_from_slice(if req.http11 {
-                b",\"proto\":\"HTTP/1.1\""
-            } else {
-                b",\"proto\":\"HTTP/1.0\""
+            b.extend_from_slice(match req.proto {
+                3 => b",\"proto\":\"HTTP/3\"",
+                2 => b",\"proto\":\"HTTP/2\"",
+                1 => b",\"proto\":\"HTTP/1.1\"",
+                _ => b",\"proto\":\"HTTP/1.0\"",
             });
             if !request_id.is_empty() {
                 b.extend_from_slice(b",\"request_id\":");

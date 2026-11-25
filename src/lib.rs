@@ -178,6 +178,9 @@ method!(w_select, |o, args, nargs| {
     if !PyErr_Occurred().is_null() {
         PyErr_WriteUnraisable(o);
     }
+    if events.is_empty() {
+        return PyRef::own(PyTuple_New(0));
+    }
     let list = PyRef::own(PyList_New(events.len() as Py_ssize_t))?;
     for (n, (fd, ev)) in events.into_iter().enumerate() {
         let t = py::tuple2(py::int(fd)?, py::int(ev as i64)?)?;
@@ -296,11 +299,30 @@ method!(w_serve, |o, args, nargs| {
     }
     let i = interned::s();
 
-    let asyncio = py::import(c"asyncio")?;
-    let task_type = py::getattr(asyncio.ptr(), c"Task")?;
-    let future_type = py::getattr(asyncio.ptr(), c"Future")?;
-    let kw_loop = PyRef::own(PyTuple_New(1))?;
-    PyTuple_SET_ITEM(kw_loop.ptr(), 0, PyRef::borrow(i.loop_).into_ptr());
+    let (task_type, future_type, kw_loop, kw_task) = if py::is_none(loop_) {
+        (
+            py::none(),
+            py::none(),
+            PyRef::own(PyTuple_New(0))?,
+            PyRef::own(PyTuple_New(0))?,
+        )
+    } else {
+        let asyncio = py::import(c"asyncio")?;
+        let task_type = py::getattr(asyncio.ptr(), c"Task")?;
+        let future_type = py::getattr(asyncio.ptr(), c"Future")?;
+        let kw_loop = PyRef::own(PyTuple_New(1))?;
+        PyTuple_SET_ITEM(kw_loop.ptr(), 0, PyRef::borrow(i.loop_).into_ptr());
+        #[cfg(Py_3_12)]
+        let kw_task = {
+            let t = PyRef::own(PyTuple_New(2))?;
+            PyTuple_SET_ITEM(t.ptr(), 0, PyRef::borrow(i.loop_).into_ptr());
+            PyTuple_SET_ITEM(t.ptr(), 1, PyRef::borrow(i.eager_start).into_ptr());
+            t
+        };
+        #[cfg(not(Py_3_12))]
+        let kw_task = kw_loop.clone();
+        (task_type, future_type, kw_loop, kw_task)
+    };
 
     let (host, port, unix_sock) = core::bind_name(fd).map_err(|e| os_error(e))?;
     let server = py::tuple2(py::str_ascii(host.as_bytes())?, py::int(port as i64)?)?;
@@ -332,6 +354,11 @@ method!(w_serve, |o, args, nargs| {
     py::dict_set(
         ext.ptr(),
         i.http_response_early_hint,
+        PyRef::own(PyDict_New())?,
+    )?;
+    py::dict_set(
+        ext.ptr(),
+        i.http_response_pathsend,
         PyRef::own(PyDict_New())?,
     )?;
     py::dict_set(proto.ptr(), i.extensions, ext)?;
@@ -564,6 +591,11 @@ method!(w_serve, |o, args, nargs| {
             i.http_response_early_hint,
             PyRef::own(PyDict_New())?,
         )?;
+        py::dict_set(
+            ext.ptr(),
+            i.http_response_pathsend,
+            PyRef::own(PyDict_New())?,
+        )?;
         py::dict_set(ext.ptr(), i.webtransport, PyRef::own(PyDict_New())?)?;
         Some(ext)
     } else {
@@ -615,6 +647,7 @@ method!(w_serve, |o, args, nargs| {
         task_type,
         future_type,
         kw_loop,
+        kw_task,
         scope_proto: proto,
         ws_scope_proto: ws_proto,
         ws,
@@ -651,11 +684,20 @@ method!(w_serve, |o, args, nargs| {
         alt_svc,
         h3_extensions,
     };
-    ops::configure(match opt(opts, c"access_log")? {
-        Some(v) if py::str_view(v)? == b"json" => Some(true),
-        Some(v) if py::str_view(v)? == b"text" => Some(false),
+    let access_log_file = match opt(opts, c"access_log_file")? {
+        Some(v) if !py::str_view(v)?.is_empty() => {
+            Some(String::from_utf8_lossy(py::str_view(v)?).into_owned())
+        }
         _ => None,
-    });
+    };
+    ops::configure(
+        match opt(opts, c"access_log")? {
+            Some(v) if py::str_view(v)? == b"json" => Some(true),
+            Some(v) if py::str_view(v)? == b"text" => Some(false),
+            _ => None,
+        },
+        access_log_file,
+    );
     let exclusive = opt_bool(opts, c"exclusive", false)?;
     (*w.core)
         .serve(fd, ctx, exclusive)
@@ -754,10 +796,12 @@ unsafe extern "C" fn module_exec(m: *mut PyObject) -> c_int {
                 return Err(PyErr);
             }
             for (name, v) in [
-                (c"EVENT_READ", fdpoll::READ),
-                (c"EVENT_WRITE", fdpoll::WRITE),
+                (c"EVENT_READ", fdpoll::READ as i64),
+                (c"EVENT_WRITE", fdpoll::WRITE as i64),
+                (c"METRICS_PAGE_BYTES", metrics::PAGE_BYTES as i64),
+                (c"RATE_MAP_BYTES", limit::MAP_BYTES as i64),
             ] {
-                let v = py::int(v as i64)?;
+                let v = py::int(v)?;
                 if PyModule_AddObjectRef(m, name.as_ptr(), v.ptr()) < 0 {
                     return Err(PyErr);
                 }

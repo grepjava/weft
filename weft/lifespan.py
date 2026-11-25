@@ -27,9 +27,13 @@ class Lifespan:
         self._queue: asyncio.Queue = asyncio.Queue()
         self._started = asyncio.Event()
         self._stopped = asyncio.Event()
+        self._startup_delivered = False
 
     async def _receive(self):
-        return await self._queue.get()
+        msg = await self._queue.get()
+        if msg.get('type') == 'lifespan.startup':
+            self._startup_delivered = True
+        return msg
 
     async def _send(self, message):
         kind = message['type']
@@ -49,10 +53,13 @@ class Lifespan:
     async def _main(self):
         try:
             await self.app(self.scope, self._receive, self._send)
-        except BaseException as exc:
-            if not self._started.is_set() and self.mode == 'auto':
+        except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
+            raise
+        except Exception as exc:
+            if not self._started.is_set() and not self._startup_delivered and self.mode == 'auto':
                 # An application without lifespan support raises as soon as it
-                # sees the scope type: an opt-out, not a failure.
+                # sees the scope type, before ever awaiting receive(): an
+                # opt-out, not a startup failure.
                 self.unsupported = True
                 logger.info("ASGI 'lifespan' protocol appears unsupported.")
             else:
