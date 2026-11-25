@@ -14,6 +14,7 @@ and signal handling, is asyncio's own code, unchanged.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import selectors
 import signal
 import sys
@@ -83,12 +84,39 @@ class WeftSelector(selectors._BaseSelectorImpl):
         return ready
 
 
+class _Handle(asyncio.Handle):
+    """`asyncio.Handle` without the debug-mode bookkeeping, for the
+    non-debug fast path of `WeftEventLoop.call_soon`."""
+
+    __slots__ = ()
+
+    def __init__(self, callback, args, loop, context=None):
+        self._context = contextvars.copy_context() if context is None else context
+        self._loop = loop
+        self._callback = callback
+        self._args = args
+        self._cancelled = False
+        self._repr = None
+        self._source_traceback = None
+
+
 class WeftEventLoop(asyncio.SelectorEventLoop):
     """`SelectorEventLoop` driven by a native worker."""
 
     def __init__(self, worker: Worker | None = None):
         self.worker = worker if worker is not None else Worker()
         super().__init__(selector=WeftSelector(self.worker))
+
+    def call_soon(self, callback, *args, context=None):
+        # Every request schedules its task step and its done callback through
+        # here, and the stock version is three Python frames plus checks that
+        # only matter in debug mode or on a closed loop. Outside those, queue
+        # the handle directly; behaviour is otherwise identical.
+        if self._debug or self._closed:
+            return super().call_soon(callback, *args, context=context)
+        handle = _Handle(callback, args, self, context)
+        self._ready.append(handle)
+        return handle
 
     def _write_to_self(self):
         # call_soon_threadsafe: wake the worker directly instead of writing

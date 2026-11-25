@@ -566,3 +566,35 @@ def test_sigterm_drains_and_shuts_down(tmp_path, mode):
         # Drained first, then every worker ran its lifespan shutdown.
         assert time.monotonic() - start >= 0.5
         assert len(mark.read_text().split()) == 2
+
+
+def test_loop_call_soon_fast_path_keeps_semantics():
+    import contextvars
+
+    from weft.loop import WeftEventLoop
+
+    var = contextvars.ContextVar('var', default='unset')
+    loop = WeftEventLoop()
+    try:
+        seen = []
+        ctx = contextvars.copy_context()
+        ctx.run(var.set, 'in-ctx')
+        loop.call_soon(lambda: seen.append(('ctx', var.get())), context=ctx)
+        var.set('outer')
+        loop.call_soon(lambda: seen.append(('copied', var.get())))
+        h = loop.call_soon(lambda: seen.append('cancelled ran'))
+        h.cancel()
+        loop.call_soon(seen.append, 'last')
+        loop.run_until_complete(asyncio.sleep(0))
+        assert seen == [('ctx', 'in-ctx'), ('copied', 'outer'), 'last']
+        assert isinstance(h, asyncio.Handle) and h.cancelled()
+
+        loop.set_debug(True)
+        h = loop.call_soon(seen.append, 'debug')
+        assert h._source_traceback  # debug mode still records where it came from
+        loop.run_until_complete(asyncio.sleep(0))
+        assert seen[-1] == 'debug'
+    finally:
+        loop.close()
+    with pytest.raises(RuntimeError, match='closed'):
+        loop.call_soon(print)

@@ -230,3 +230,35 @@ def test_concurrency(basic):
     with concurrent.futures.ThreadPoolExecutor(32) as ex:
         results = list(ex.map(one, range(32)))
     assert all(r == ['slept'] * 5 for r in results)
+
+
+def test_app_errors_reported_once_and_task_semantics_kept(caplog):
+    import asyncio
+    import logging
+
+    import httpx
+
+    from tests.conftest import serve_thread
+
+    async def app(scope, receive, send):
+        if scope['type'] != 'http':
+            return
+        assert asyncio.current_task() is not None
+        if scope['path'] == '/before':
+            raise ValueError('boom-before')
+        await send({'type': 'http.response.start', 'status': 200, 'headers': []})
+        await send({'type': 'http.response.body', 'body': b'ok'})
+        if scope['path'] == '/after':
+            raise ValueError('boom-after')
+
+    caplog.set_level(logging.DEBUG)
+    with serve_thread(app, lifespan='off') as url:
+        with httpx.Client() as c:
+            assert c.get(url + '/before').status_code == 500
+            assert c.get(url + '/after').text == 'ok'
+            assert c.get(url + '/fine').text == 'ok'  # same connection still usable
+    text = caplog.text
+    assert text.count('boom-before') >= 1 and text.count('boom-after') >= 1
+    reports = [r for r in caplog.records if r.exc_info and 'boom' in str(r.exc_info[1])]
+    assert len(reports) == 2, [r.getMessage() for r in reports]
+    assert 'never retrieved' not in text
