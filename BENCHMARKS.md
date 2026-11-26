@@ -77,3 +77,73 @@ TSV: `bench/results/weft-vs-peregrine-256.tsv`,
 Not comparable with the site’s published dataset (this machine, 4 workers,
 load generator on the same host). The three columns are comparable with
 each other.
+
+---
+
+## FreeBSD: 64, 256 and 512 connections
+
+Weft, uvicorn and Granian at the-benchmarker's three concurrency levels.
+
+Measured 2026-11-26 on the same machine (Intel i5-8250U, 4 cores / 8
+threads), booted into FreeBSD 15.1. CPython 3.14.10. Weft 0.2.0 (release
+build, commit `cfafe1c`). uvicorn 0.54.0 with uvloop and httptools.
+Granian 2.8.9, built from source (no FreeBSD wheel). FastAPI 0.165.0 /
+Starlette 1.10.0 / Pydantic 2.14.4. `oha` 1.17.0.
+
+Every response was a 200 and every server started. Requests per second,
+the mean of the three contract routes (`GET /`, `GET /user/42`,
+`POST /user`), each the median of two rounds. Bold is the highest in the
+column.
+
+### FastAPI
+
+| server | 64 | 256 | 512 |
+|---|---:|---:|---:|
+| Weft | **18,603** | **19,577** | **20,026** |
+| uvicorn | 14,821 | 15,222 | 15,120 |
+| Granian | 14,811 | 15,220 | 14,999 |
+| Weft / uvicorn | 1.26× | 1.29× | 1.32× |
+| Weft / Granian | 1.26× | 1.29× | 1.34× |
+
+### Raw ASGI
+
+| server | 64 | 256 | 512 |
+|---|---:|---:|---:|
+| Weft | **90,983** | **112,010** | **112,979** |
+| uvicorn | 45,745 | 48,806 | 49,284 |
+| Granian | 53,212 | 55,592 | 56,946 |
+| Weft / uvicorn | 1.99× | 2.30× | 2.29× |
+| Weft / Granian | 1.71× | 2.01× | 1.98× |
+
+Weft is ahead on every route at every level, and its lowest round is above
+the others' highest. From 64 to 512 connections Weft gains 8% (FastAPI) and
+24% (raw ASGI); uvicorn and Granian stay flat. At 512 connections uvicorn
+had 9–254 failed connections in 7 of its 12 runs, beyond the one in-flight
+request per connection that every server has cut at the deadline; Weft and
+Granian had none.
+
+### Method
+
+The site's shape, with `oha` in place of `zrk` (not packaged for FreeBSD).
+Both are closed-loop with keep-alive: each connection sends its next
+request when the last one is answered.
+
+```
+warm-up    oha --no-tui -m METHOD -c 50 -z 5s URL
+per run    oha --no-tui --output-format json -m METHOD -c N -z 15s URL
+```
+
+Eight worker processes per server (`$(nproc)`, as on the site), unpinned,
+with the load generator on the same host. Intel Speed Shift EPP 0 during
+the run. Two rounds, the second in reverse order. Apps:
+`bench/apps/tb_fastapi.py`, `bench/apps/tb_asgi.py`.
+
+```
+sh bench/freebsd_levels.sh   # OUT=/tmp/levels.jsonl
+python bench/levels_summary.py /tmp/levels.jsonl
+```
+
+Raw results: `bench/data/freebsd-levels-2026-11-26.jsonl`.
+
+Not comparable with the site's published numbers (different machine and
+load generator). The columns are comparable with each other.
