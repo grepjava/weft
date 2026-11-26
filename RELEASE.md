@@ -19,6 +19,58 @@ Distribution name: `weft-server`. Import package `weft`, CLI `weft`.
 
 ---
 
+## 0.2.0 — 2026-11-26
+
+### Added
+
+- FreeBSD: the extension imports and the test suite passes on FreeBSD
+  15.1 (it failed to load with "No space available for static Thread
+  Local Storage"; mimalloc now uses local-dynamic TLS on the BSDs).
+  Benchmarks there in [BENCHMARKS.md](https://github.com/grepjava/weft/blob/master/BENCHMARKS.md#freebsd-64-256-and-512-connections).
+- Configuration from a TOML file (`--config PATH`, or `[tool.weft]` in
+  `pyproject.toml`) and from `WEFT_*` environment variables, typed from
+  the option they set. A flag on the command line beats both.
+- `--access-log-file`. The access log is written by a background thread
+  and flushed before a worker exits.
+- Static files: `Range` requests (206, 416, `If-Range`) and
+  `Last-Modified` / `If-Modified-Since`.
+- ASGI `http.response.pathsend`.
+- `wsgi.input` is native and has `seek`, `tell`, `readinto`, `readable`,
+  `seekable`, `getvalue` and `close`.
+- `WEFT_EAGER_TASKS=1` starts each HTTP request's task eagerly. Off by
+  default: it cost FastAPI about 8% requests/s at saturation.
+
+### Fixed
+
+- Behind trusted proxies, the scheme (`X-Forwarded-Proto`, `Forwarded`
+  `proto`) is taken from the same hop as the client address, not always
+  the last one.
+- WSGI: a `write()` that filled the socket spun forever.
+- HTTP/2: stream count and header size are bounded, with a graceful
+  GOAWAY, and a flow-control busy-spin is gone.
+- HTTP/3: request streams are spawned instead of read inline, and
+  malformed WebTransport streams are dropped.
+- Brotli streams are finished properly; chunked responses no longer get
+  duplicate framing headers or a stray `Vary`.
+- TLS read, flush and `close_notify` handling; WebSocket length checks;
+  the rate limiter's clock and hashing; metrics alignment.
+- Request ids come from a CSPRNG.
+
+### Changed
+
+- Faster request path:
+  - one fewer syscall per HTTP/1 request on Unix (raw ASGI +7.8%
+    requests/s at saturation);
+  - zero-copy reads and per-worker object freelists;
+  - a leaner `call_soon` in Weft's event loop;
+  - less per-request work on the WSGI path;
+  - larger flush batches under high concurrency;
+  - a response cache with lock-free hints and LRU eviction.
+- On FreeBSD, Weft serves FastAPI at about 1.3× uvicorn and Granian, and
+  raw ASGI at 1.7–2.3×, at 64, 256 and 512 connections.
+
+---
+
 ## 0.1.1 — 2026-10-23
 
 ### Fixed
