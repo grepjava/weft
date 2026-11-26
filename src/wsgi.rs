@@ -249,20 +249,21 @@ pub unsafe fn environ(
                 _ => continue,
             };
             let value = latin1(h.value)?;
-            let prev = PyDict_GetItemWithError(d, key.ptr());
-            if prev.is_null() {
-                if !PyErr_Occurred().is_null() {
-                    return Err(PyErr);
-                }
-                py::dict_set(d, key.ptr(), value)?;
-            } else {
+            let mut prev = ptr::null_mut();
+            let existed =
+                pyo3_ffi::compat::PyDict_SetDefaultRef(d, key.ptr(), value.ptr(), &mut prev);
+            if existed < 0 {
+                return Err(PyErr);
+            }
+            let prev = PyRef::own(prev)?;
+            if existed != 0 {
                 let sep: &[u8] = if key.ptr() == i.http_cookie {
                     b"; "
                 } else {
                     b", "
                 };
                 let sep = py::str_ascii(sep)?;
-                let joined = PyRef::own(PyUnicode_Concat(prev, sep.ptr()))?;
+                let joined = PyRef::own(PyUnicode_Concat(prev.ptr(), sep.ptr()))?;
                 let joined = PyRef::own(PyUnicode_Concat(joined.ptr(), value.ptr()))?;
                 py::dict_set(d, key.ptr(), joined)?;
             }
@@ -273,6 +274,7 @@ pub unsafe fn environ(
 
 // --- start_response / write ------------------------------------------------------
 
+#[derive(Default)]
 struct Pending {
     status: u16,
     head: Vec<u8>,
@@ -291,7 +293,7 @@ struct StartResponseObj {
     called: bool,
     /// The head has been handed to the connection.
     sent: bool,
-    pending: Option<Box<Pending>>,
+    pending: Pending,
     /// Set while the request runs on a pool thread: where its output goes.
     sink: Option<Box<Sink>>,
 }
@@ -718,11 +720,16 @@ unsafe fn start_response(conn: &Conn) -> PResult<PyRef> {
     unsafe {
         let tp = START_TYPE.get().expect("wsgi::init").0;
         let o = types::alloc(tp, std::mem::size_of::<StartResponseObj>())?;
+        let mut st = conn.st.borrow_mut();
+        ptr::addr_of_mut!((*o.cast::<StartResponseObj>()).pending).write(Pending {
+            head: std::mem::take(&mut st.resp.head),
+            ..Pending::default()
+        });
         let sr = &mut *(o as *mut StartResponseObj);
         sr.vectorcall = Some(sr_vectorcall);
         sr.slot = conn.slot;
         sr.generation = conn.generation;
-        sr.seq = conn.st.borrow().seq;
+        sr.seq = st.seq;
         sr.live = true;
         PyRef::own(o)
     }
@@ -804,7 +811,14 @@ unsafe fn begin(
                 "start_response() called again without exc_info",
             ));
         }
-        sr.pending = Some(Box::new(encode_head(status, headers)?));
+        // A failed replacement must leave the original response intact.
+        if sr.called {
+            let mut replacement = Pending::default();
+            encode_head(status, headers, &mut replacement)?;
+            sr.pending = replacement;
+        } else {
+            encode_head(status, headers, &mut sr.pending)?;
+        }
         sr.called = true;
         Ok(())
     }
@@ -813,9 +827,15 @@ unsafe fn begin(
 /// The status line and the application's headers, checked, as they go on
 /// the wire. Framing headers are noted the same way ASGI's are; a
 /// `Transfer-Encoding` from the application is dropped, since framing is ours.
-unsafe fn encode_head(status: *mut PyObject, headers: *mut PyObject) -> PResult<Pending> {
+unsafe fn encode_head(
+    status: *mut PyObject,
+    headers: *mut PyObject,
+    pending: &mut Pending,
+) -> PResult<()> {
     unsafe {
-        let mut head = Vec::with_capacity(256);
+        let head = &mut pending.head;
+        head.clear();
+        head.reserve(256);
         head.extend_from_slice(b"HTTP/1.1 ");
         let mut code = 0u16;
         latin1_bytes(status, "status", |v| {
@@ -909,11 +929,9 @@ unsafe fn encode_head(status: *mut PyObject, headers: *mut PyObject) -> PResult<
             }
             head.extend_from_slice(b"\r\n");
         }
-        Ok(Pending {
-            status: code,
-            head,
-            info,
-        })
+        pending.status = code;
+        pending.info = info;
+        Ok(())
     }
 }
 
@@ -941,16 +959,14 @@ unsafe fn commit(sr: &mut StartResponseObj, conn: &Conn, length: Option<u64>) ->
 }
 
 /// The head to send, once: `None` if it has gone already.
-unsafe fn take_head(
-    sr: &mut StartResponseObj,
-    length: Option<u64>,
-) -> PResult<Option<Box<Pending>>> {
+unsafe fn take_head(sr: &mut StartResponseObj, length: Option<u64>) -> PResult<Option<Pending>> {
     if sr.sent {
         return Ok(None);
     }
-    let Some(mut p) = sr.pending.take() else {
+    if !sr.called {
         return Err(unsafe { py::runtime_error("the application did not call start_response()") });
-    };
+    }
+    let mut p = std::mem::take(&mut sr.pending);
     if p.info.length.is_none()
         && let Some(n) = length
         && p.status >= 200
@@ -1522,7 +1538,7 @@ unsafe fn pool_respond(srp: *mut StartResponseObj, sink: &Sink, obj: *mut PyObje
     unsafe {
         let head = |length| -> PResult<bool> {
             Ok(match take_head(&mut *srp, length)? {
-                Some(p) => emit(sink, Msg::Head(p)),
+                Some(p) => emit(sink, Msg::Head(Box::new(p))),
                 None => true,
             })
         };
@@ -1601,7 +1617,7 @@ unsafe fn pool_write(sr: &mut StartResponseObj, data: &[u8]) -> PResult<()> {
             return Err(disconnected());
         };
         if let Some(p) = take_head(sr, None)?
-            && !emit(&sink, Msg::Head(p))
+            && !emit(&sink, Msg::Head(Box::new(p)))
         {
             return Err(disconnected());
         }

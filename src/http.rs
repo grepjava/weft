@@ -855,8 +855,14 @@ pub fn flush_soon(sh: &Shared, conn: &Conn) -> bool {
 /// `FLUSH_BATCH` are waiting. What the socket will not take at once is left
 /// to a task of its own.
 pub fn run_flush_soon(sh: &Shared) {
-    let queued = std::mem::take(&mut *sh.soon.borrow_mut());
-    for (slot, generation) in queued {
+    let mut queued = {
+        let mut soon = sh.soon.borrow_mut();
+        if soon.is_empty() {
+            return;
+        }
+        std::mem::take(&mut *soon)
+    };
+    for (slot, generation) in queued.drain(..) {
         let Some(conn) = sh.conn(slot, generation) else {
             continue;
         };
@@ -881,6 +887,10 @@ pub fn run_flush_soon(sh: &Shared) {
                 let _ = flush_all(&ctx, &conn).await;
             });
         }
+    }
+    let mut soon = sh.soon.borrow_mut();
+    if soon.is_empty() {
+        *soon = queued;
     }
 }
 
@@ -1122,16 +1132,16 @@ pub async fn read_some(
         }
     };
     if idle {
-        let mut stop = pin!(sh.stop.notified());
-        stop.as_mut().enable();
-        if sh.stopping.get() {
-            return None;
-        }
-        tokio::select! {
-            biased;
-            _ = &mut stop => None,
-            r = tokio::time::timeout(limit, read) => r.ok().flatten(),
-        }
+        let mut read = pin!(tokio::time::timeout(limit, read));
+        poll_fn(|cx| {
+            if sh.stopping.get() {
+                return Poll::Ready(None);
+            }
+            // Shutdown already wakes every connection through this slot.
+            conn.set_waker(cx);
+            read.as_mut().poll(cx).map(|result| result.ok().flatten())
+        })
+        .await
     } else {
         tokio::time::timeout(limit, read).await.ok().flatten()
     }

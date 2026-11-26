@@ -94,9 +94,9 @@ fn parse_len(v: &[u8]) -> Option<u64> {
 
 /// Parses one request head from `rbuf` and starts the application on it.
 pub fn dispatch(sh: &Shared, ctx: &Rc<AppCtx>, conn: &Rc<Conn>, rbuf: &mut BytesMut) -> Parsed {
-    let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
-    let mut req = httparse::Request::new(&mut headers);
-    let n = match req.parse(rbuf) {
+    let mut headers = [std::mem::MaybeUninit::uninit(); MAX_HEADERS];
+    let mut req = httparse::Request::new(&mut []);
+    let n = match req.parse_with_uninit_headers(rbuf, &mut headers) {
         Ok(httparse::Status::Complete(n)) if n > ctx.max_head => return Parsed::Reject(431),
         Ok(httparse::Status::Complete(n)) => n,
         Ok(httparse::Status::Partial) => return Parsed::Partial,

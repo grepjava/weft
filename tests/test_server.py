@@ -467,7 +467,8 @@ def test_ctrl_c_stops_process_workers():
     assert not [p for p in pids if _alive(p)]
 
 
-def test_signal_stops_idle_single_wsgi_worker():
+@pytest.mark.parametrize('keep_alive_client', [False, True])
+def test_signal_stops_idle_single_wsgi_worker(keep_alive_client):
     """An idle single-process WSGI worker blocks in the native select();
     a signal must still wake it and stop it."""
     import signal
@@ -479,10 +480,14 @@ def test_signal_stops_idle_single_wsgi_worker():
     else:
         popen = {}
         sig = signal.SIGINT
-    with serve_process('tests.apps.wsgi_app:app', '--interface', 'wsgi', **popen) as (url, proc):
-        time.sleep(0.5)  # let it go idle in select()
-        proc.send_signal(sig)
-        assert proc.wait(10) == 0
+    args = ('--interface', 'wsgi', '--keep-alive', '60', '--graceful-timeout', '20')
+    with serve_process('tests.apps.wsgi_app:app', *args, **popen) as (url, proc):
+        with httpx.Client() as client:
+            if keep_alive_client:
+                assert client.get(url).status_code == 200
+            time.sleep(0.5)  # let it go idle in select()
+            proc.send_signal(sig)
+            assert proc.wait(10) == 0
 
 
 def test_second_signal_during_wsgi_shutdown_does_not_spin():
