@@ -822,7 +822,7 @@ pub fn flush_direct(io: &Io, out: &mut BytesMut) -> io::Result<bool> {
 
 /// Finished responses held for the end of the batch before they go out
 /// anyway: holding one costs its client the time the ones after it take.
-const FLUSH_BATCH: usize = 16;
+const FLUSH_BATCH: usize = 64;
 
 /// Sends a finished response together with the others finishing in the same
 /// batch of ready connections, rather than on its own. A write wakes the

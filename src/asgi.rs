@@ -1050,6 +1050,11 @@ pub unsafe fn encode_headers(
     skip: Option<fn(&[u8]) -> bool>,
 ) -> PResult<()> {
     unsafe {
+        if (PyList_CheckExact(headers) != 0 && PyList_GET_SIZE(headers) == 0)
+            || (PyTuple_CheckExact(headers) != 0 && PyTuple_GET_SIZE(headers) == 0)
+        {
+            return Ok(());
+        }
         let it = PyRef::own(PyObject_GetIter(headers))?;
         loop {
             let item = PyIter_Next(it.ptr());
