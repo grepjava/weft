@@ -54,6 +54,13 @@ zstd = "0.13"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Python loads the extension with dlopen, and the BSD loaders keep only a
+# small reserve of static TLS for that: mimalloc's default initial-exec TLS
+# makes the import fail ("No space available for static Thread Local
+# Storage"). Local-dynamic TLS is allocated on demand instead.
+[target.'cfg(any(target_os = "freebsd", target_os = "netbsd", target_os = "openbsd", target_os = "dragonfly"))'.dependencies]
+mimalloc = { version = "0.1.49", default-features = false, features = ["local_dynamic_tls"], optional = true }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
